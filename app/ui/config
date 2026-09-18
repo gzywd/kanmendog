@@ -1,0 +1,13 @@
+{
+  ".url": {
+    "com.gzywd.kanmendog.main": {
+      "title": "看门狗 KanmenDog",
+      "icon": "images/icon_64.png",
+      "type": "iframe",
+      "protocol": "http",
+      "port": "8900",
+      "url": "/",
+      "allUsers": false
+    }
+  }
+}

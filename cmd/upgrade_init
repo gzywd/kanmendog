@@ -1,0 +1,4 @@
+#!/bin/bash
+# cmd/upgrade_init —— 升级前执行（无前置依赖，空操作占位）
+set -u
+exit 0

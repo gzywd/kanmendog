@@ -1,0 +1,8 @@
+#!/bin/bash
+# cmd/upgrade_callback —— 升级后执行：确保服务在运行（配置由页面即时生效）
+set -u
+
+SERVICE="com.gzywd.kanmendog.service"
+systemctl daemon-reload >/dev/null 2>&1
+systemctl is-active --quiet "$SERVICE" || systemctl start "$SERVICE" >/dev/null 2>&1
+exit 0

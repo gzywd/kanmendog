@@ -1,0 +1,91 @@
+#!/bin/bash
+# cmd/install_callback —— 安装文件应用后执行：加载看门狗、写内核 lockup 兜底、注册 systemd 服务
+set -u
+
+APPDEST="${TRIM_APPDEST:-/var/apps/com.gzywd.kanmendog/target}"
+PKGETC="${TRIM_PKGETC:-/etc/kanmendog}"
+PKGVAR="${TRIM_PKGVAR:-/var/lib/kanmendog}"
+SERVICE="com.gzywd.kanmendog.service"
+LOG="${TRIM_TEMP_LOGFILE:-/tmp/kanmendog-install.log}"
+
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+
+# 1) 确保二进制可执行
+if [ ! -x "$APPDEST/kanmendog" ]; then
+  chmod +x "$APPDEST/kanmendog" 2>/dev/null || { echo "缺少可执行文件 kanmendog" >"$LOG"; exit 1; }
+fi
+
+# 2) 探测并加载看门狗模块（硬件优先，软看门狗兜底）
+if [ ! -e /dev/watchdog ]; then
+  if modprobe iTCO_wdt 2>/dev/null; then
+    log "已加载硬件看门狗模块 iTCO_wdt"
+  elif modprobe softdog 2>/dev/null; then
+    log "已加载软件看门狗模块 softdog（无硬件看门狗时的退路）"
+  else
+    log "警告：未能加载任何看门狗模块，/dev/watchdog 不存在，硬复位将不可用（依赖内核 lockup→panic 兜底）"
+  fi
+else
+  log "检测到看门狗设备 /dev/watchdog"
+fi
+
+# 3) 内核 lockup 检测 → panic（配合看门狗复位内核级卡死）
+cat > /etc/sysctl.d/99-kanmendog.conf <<'EOF'
+# 由看门狗 KanmenDog 写入：把内核级卡死转化为 panic，触发看门狗复位
+kernel.softlockup_panic = 1
+kernel.hardlockup_panic = 1
+kernel.watchdog_thresh = 20
+EOF
+sysctl -p /etc/sysctl.d/99-kanmendog.conf >/dev/null 2>&1 || true
+
+# 4) 写入 systemd 服务单元（Restart=always 复用 systemd 作为进程主管）
+cat > /etc/systemd/system/"$SERVICE" <<EOF
+[Unit]
+Description=KanmenDog Watchdog (com.gzywd.kanmendog)
+After=sysinit.target
+Wants=sysinit.target
+
+[Service]
+Type=simple
+ExecStart=$APPDEST/kanmendog
+Restart=always
+RestartSec=5
+User=root
+WorkingDirectory=$PKGVAR
+Environment=TRIM_PKGETC=$PKGETC TRIM_PKGVAR=$PKGVAR
+StandardOutput=append:$PKGVAR/stdout.log
+StandardError=append:$PKGVAR/stderr.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+mkdir -p "$PKGETC" "$PKGVAR"
+
+# 5) 写入默认配置
+if [ ! -f "$PKGETC/config.json" ]; then
+  cat > "$PKGETC/config.json" <<'EOF'
+{
+  "enabled": true,
+  "interval_sec": 10,
+  "watchdog_timeout_sec": 60,
+  "fail_threshold": 3,
+  "port": 8900,
+  "auto_reboot": true,
+  "check_fork": true,
+  "check_load": true,
+  "load_threshold": 16,
+  "check_dstate": true,
+  "dstate_threshold": 20,
+  "check_service_probe": false,
+  "service_probe_cmd": ""
+}
+EOF
+  log "已写入默认配置 $PKGETC/config.json"
+fi
+
+# 6) 注册并启用服务（开机自启）
+systemctl daemon-reload >/dev/null 2>&1
+systemctl enable "$SERVICE" >/dev/null 2>&1
+log "看门狗服务已注册并设为开机自启"
+
+exit 0

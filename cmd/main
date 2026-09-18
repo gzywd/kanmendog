@@ -1,0 +1,27 @@
+#!/bin/bash
+# cmd/main —— 应用运行控制（由飞牛应用中心调用）
+# start/stop/status 封装 systemctl 对本应用看门狗服务的管理。
+set -u
+
+SERVICE="com.gzywd.kanmendog.service"
+
+case "${1:-}" in
+  start)
+    systemctl start "$SERVICE" >/dev/null 2>&1
+    exit 0
+    ;;
+  stop)
+    systemctl stop "$SERVICE" >/dev/null 2>&1
+    exit 0
+    ;;
+  status)
+    if systemctl is-active --quiet "$SERVICE"; then
+      exit 0
+    else
+      exit 3
+    fi
+    ;;
+  *)
+    exit 1
+    ;;
+esac

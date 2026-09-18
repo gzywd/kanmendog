@@ -1,0 +1,4 @@
+#!/bin/bash
+# cmd/uninstall_init —— 卸载前执行（空操作占位）
+set -u
+exit 0

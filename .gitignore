@@ -1,0 +1,14 @@
+# fnpack 打包工具（由 scripts/build.sh 自动下载，勿提交）
+/fnpack
+/fnpack-*
+
+# 打包产物
+*.fpk
+
+# 运行时日志与备份
+*.log
+*.log.1
+
+# macOS / 编辑器
+.DS_Store
+*~

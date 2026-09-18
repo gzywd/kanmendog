@@ -1,0 +1,18 @@
+#!/bin/bash
+# cmd/uninstall_callback —— 卸载清理：停服务、删单元、恢复内核参数
+set -u
+
+SERVICE="com.gzywd.kanmendog.service"
+
+# 先停止服务（若支持 magic close，看门狗会安全解除，不会触发复位）
+systemctl disable --now "$SERVICE" >/dev/null 2>&1
+
+rm -f /etc/systemd/system/"$SERVICE"
+systemctl daemon-reload >/dev/null 2>&1
+
+# 移除内核 lockup 兜底（恢复系统默认行为）
+rm -f /etc/sysctl.d/99-kanmendog.conf
+
+# 注意：保留 PKGVAR 下的日志与 last_reboot_reason，便于事后排查；
+# 如需彻底清理可手动删除对应目录。
+exit 0

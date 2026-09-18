@@ -1,0 +1,8 @@
+#!/bin/bash
+# cmd/config_callback —— 配置变更应用后执行：让守护进程重新加载配置
+# 配置由 Web 页面直接写入 TRIM_PKGETC/config.json 并即时生效，这里仅确保服务在运行。
+set -u
+
+SERVICE="com.gzywd.kanmendog.service"
+systemctl is-active --quiet "$SERVICE" || systemctl start "$SERVICE" >/dev/null 2>&1
+exit 0

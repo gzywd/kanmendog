@@ -1,0 +1,11 @@
+[
+  {
+    "stepTitle": "卸载",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "卸载会停止看门狗服务、移除 systemd 单元与内核 lockup 兜底参数。运行日志与 last_reboot_reason 会保留在应用数据目录，便于事后排查；如需彻底清理可手动删除对应目录。"
+      }
+    ]
+  }
+]

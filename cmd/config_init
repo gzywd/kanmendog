@@ -1,0 +1,4 @@
+#!/bin/bash
+# cmd/config_init —— 配置变更应用前执行（无前置依赖，空操作占位）
+set -u
+exit 0

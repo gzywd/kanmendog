@@ -1,0 +1,4 @@
+#!/bin/bash
+# cmd/install_init —— 安装文件应用前执行（无前置依赖，空操作占位）
+set -u
+exit 0
