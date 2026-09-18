@@ -1,5 +1,15 @@
 // 看门狗 KanmenDog —— fnOS 死机自动重启守护进程
 //
+// v1.3.2 修复（UI 功能修复 + auto_reboot 开关修正）：
+//   - 【严重】auto_reboot=false 时不再关闭看门狗 fd（原行为导致 60s 后硬复位，
+//     auto_reboot 开关形同虚设）；现仅记录+告警，主循环继续喂狗。
+//   - 【严重】status API 补充缺失字段：maintain_until, probe_fail_count,
+//     port_migrate_detected —— 修复维护倒计时/学习期提示/端口迁移警告三个 UI 功能
+//     因字段名不匹配而完全不可用的 bug。
+//   - 【中危】triggerReboot 释放 mutex 前捕获 WatchdogTimeoutSec 到局部变量，
+//     消除释放锁后访问 d.cfg 的数据竞争。
+//   - 探针失败计数 probeFailCount 现在正确递增/归零，UI 学习期进度条可工作。
+//
 // v1.3.1 修复（致命缺陷+硬件信息增强）：
 //   - 【致命】修复 triggerReboot 返回后主循环继续喂狗导致重启失效的 bug：
 //     原 triggerReboot 设 monitoring=false 但 petWatchdog() 只检查 wd!=nil，
@@ -56,7 +66,7 @@ var uiFS embed.FS
 
 const (
 	appName        = "com.gzywd.kanmendog"
-	appVersion     = "1.3.1"
+	appVersion     = "1.3.2"
 	defaultPort    = 8900
 	watchdogDevice = "/dev/watchdog"
 	logMaxBytes    = 5 * 1024 * 1024  // 日志滚动阈值
@@ -965,28 +975,33 @@ type status struct {
 	LastRebootReason  string `json:"last_reboot_reason"`
 	ConsecutiveFails  int    `json:"consecutive_fails"`
 	Pid               int    `json:"pid"`
-	InBootGrace       bool   `json:"in_boot_grace"`  // 开机冷却期内
-	UpgradeBusy       string `json:"upgrade_busy"`   // 非空=维护窗口原因（升级/关机中）
-	BootReason        string `json:"boot_reason"`    // 本次开机自检结论（来源标注）
-	MaintainLeftMin   int    `json:"maintain_left_min"` // 手动维护模式剩余分钟（0=无）
-	ProbeLearning     bool   `json:"probe_learning"`    // 探针处于学习期（未计入判定）
+	InBootGrace       bool   `json:"in_boot_grace"`          // 开机冷却期内
+	UpgradeBusy       string `json:"upgrade_busy"`           // 非空=维护窗口原因（升级/关机中）
+	BootReason        string `json:"boot_reason"`            // 本次开机自检结论（来源标注）
+	MaintainLeftMin   int    `json:"maintain_left_min"`      // 手动维护模式剩余分钟（0=无）
+	MaintainUntil     int64  `json:"maintain_until"`         // 手动维护模式截止 unix 秒（0=无；UI 倒计时用）
+	ProbeLearning     bool   `json:"probe_learning"`         // 探针处于学习期（未计入判定）
+	ProbeFailCount    int    `json:"probe_fail_count"`       // 探针连续失败次数（UI 学习期进度条用）
+	PortMigrateDetected string `json:"port_migrate_detected"` // 检测到端口迁移时的候选端口提示（空=无）
 }
 
 // ---- 主守护进程 ----
 
 type daemon struct {
-	cfg        Config
-	mu         sync.Mutex
-	wd         *watchdog
-	wdTimeout  int // 驱动实际生效的看门狗超时
-	monitoring bool // 当前是否在喂狗（enabled 且已开狗）
-	failCount  int
-	lastReason string
-	startTime  time.Time
-	cycle      int      // 健康检查周期计数，用于趋势日志
-	probeEverOK bool    // 探针自本次进程启动以来是否成功过（学习期判定）
-	wasBusy    bool     // 上一周期是否处于维护窗口（边沿检测用）
-	portWarned  bool    // 端口迁移警告是否已发出（避免重复告警）
+	cfg               Config
+	mu                sync.Mutex
+	wd                *watchdog
+	wdTimeout         int  // 驱动实际生效的看门狗超时
+	monitoring        bool // 当前是否在喂狗（enabled 且已开狗）
+	failCount         int
+	lastReason        string
+	startTime         time.Time
+	cycle             int      // 健康检查周期计数，用于趋势日志
+	probeEverOK       bool     // 探针自本次进程启动以来是否成功过（学习期判定）
+	probeFailCount    int      // 探针连续失败次数（UI 学习期进度展示用）
+	wasBusy           bool     // 上一周期是否处于维护窗口（边沿检测用）
+	portWarned        bool     // 端口迁移警告是否已发出（避免重复告警）
+	portMigrateInfo   string   // 端口迁移检测到的候选端口信息（UI 展示用，空=无）
 }
 
 func loadOrInitConfig(cfg *Config) {
@@ -1132,6 +1147,9 @@ func (d *daemon) inMaintainMode() bool {
 // v1.3.1 致命修复：决定重启后设 wd=nil（彻底停止喂狗，不依赖 monitoring 标志），
 // 若所有重启方式均失败则阻塞不返回（等待硬件看门狗兜底复位），
 // 绝不让主循环有机会在重启失败后继续喂狗导致永远无法重启。
+//
+// v1.3.2 修复：auto_reboot=false 时仅记录+告警，不关闭看门狗 fd、不阻塞，
+// 主循环继续喂狗 —— 用户关掉自动重启的意图是"只观察不重启"，不是"延迟 60 秒后硬复位"。
 func (d *daemon) triggerReboot(reason string) {
 	if busy := systemBusyReason(); busy != "" {
 		logf("判定达到阈值，但系统处于维护窗口（%s），放弃本次重启并清零计数（防误杀升级/正常重启）", busy)
@@ -1150,13 +1168,21 @@ func (d *daemon) triggerReboot(reason string) {
 
 	ts := time.Now().Format(time.RFC3339)
 
+	// v1.3.2：auto_reboot=false → 仅记录，不碰看门狗，不阻塞（用户意图：只观察）
+	if !d.cfg.AutoReboot {
+		logf("!!! 判定系统死机（auto_reboot=off，仅记录不重启）！！！")
+		logf("原因: %s", reason)
+		logf("若后续需要自动重启，请在页面开启 auto_reboot 或到参数配置勾选'判定死机后自动重启'")
+		// 第一段：落盘最小事实（不关闭看门狗）
+		minimal := ts + "\n" + reason + "\n\n(auto_reboot=off: 本次仅记录，未执行重启)\n"
+		_ = os.WriteFile(d.cfg.reasonPath(), []byte(minimal), 0o644)
+		return // ← 关键：返回主循环继续喂狗，绝不触发硬件复位
+	}
+
 	// === 决定重启的不可逆点：从此刻起彻底停止喂狗 ===
-	// v1.3.1 关键修复：关闭 fd 并设 wd=nil（不写 magic close 'V'），
-	// 让看门狗驱动开始倒计时。petWatchdog() 只检查 wd!=nil，
-	// 不检查 monitoring 标志 —— 所以必须清 nil 才能确保不喂狗。
-	// 若此后 reboot 系统调用也失败，本函数将阻塞不返回（select{}），
-	// 主循环不可能恢复喂狗 —— 硬件看门狗将在超时后兜底复位。
+	// v1.3.2：捕获所需配置值后再操作（防释放锁后的数据竞争）
 	d.mu.Lock()
+	wdTimeoutSec := d.cfg.WatchdogTimeoutSec
 	if d.wd != nil {
 		syscall.Close(d.wd.fd)
 		d.wd.fd = -1
@@ -1170,12 +1196,7 @@ func (d *daemon) triggerReboot(reason string) {
 	_ = os.WriteFile(d.cfg.reasonPath(), []byte(minimal), 0o644)
 	gLog.Write([]byte(fmt.Sprintf("[%s] !!! 判定系统死机，准备重启 !!!\n原因: %s\n", ts, reason)))
 	gLog.Write([]byte(fmt.Sprintf("[%s] 看门狗 fd 已关闭（不 magic close），硬件倒计时开始（约 %d 秒后硬复位）\n",
-		ts, d.cfg.WatchdogTimeoutSec)))
-
-	if !d.cfg.AutoReboot {
-		logf("auto_reboot=false，仅记录不重启。注意：看门狗 fd 已关闭，%d 秒后将硬复位除非手动干预", d.cfg.WatchdogTimeoutSec)
-		select {} // 阻塞：不重启但也不让主循环恢复喂狗
-	}
+		ts, wdTimeoutSec)))
 
 	// 第二段：完整快照（可能较慢）追加落盘
 	snapshot := systemSnapshot()
@@ -1203,8 +1224,8 @@ func (d *daemon) triggerReboot(reason string) {
 	if rebootOK {
 		// 重启命令已发出；等待硬件看门狗兜底（若命令实际未生效）
 		gLog.Write([]byte(fmt.Sprintf("[%s] 等待系统重启...（若 %d 秒内未重启，硬件看门狗将硬复位）\n",
-			time.Now().Format(time.RFC3339), d.cfg.WatchdogTimeoutSec)))
-		time.Sleep(time.Duration(d.cfg.WatchdogTimeoutSec+5) * time.Second)
+			time.Now().Format(time.RFC3339), wdTimeoutSec)))
+		time.Sleep(time.Duration(wdTimeoutSec+5) * time.Second)
 		// sleep 被唤醒（不应发生）：继续阻塞
 		gLog.Write([]byte(fmt.Sprintf("[%s] *** 异常：等待超时系统仍未重启 ***\n", time.Now().Format(time.RFC3339))))
 		select {}
@@ -1212,9 +1233,9 @@ func (d *daemon) triggerReboot(reason string) {
 
 	// 所有重启方式均失败：记录严重错误并永久阻塞，等硬件看门狗兜底
 	gLog.Write([]byte(fmt.Sprintf("[%s] *** 致命：所有重启方式均失败，看门狗已关闭 %d 秒后硬复位 ***\n",
-		time.Now().Format(time.RFC3339), d.cfg.WatchdogTimeoutSec)))
+		time.Now().Format(time.RFC3339), wdTimeoutSec)))
 	gLog.Write([]byte(fmt.Sprintf("[%s] 永久阻塞中（防止返回主循环恢复喂狗导致无法重启）\n", time.Now().Format(time.RFC3339))))
-	select {} // 永久阻塞 —— v1.3.1 核心安全保证
+	select {} // 永久阻塞 —— 核心安全保证
 }
 
 // loop 主循环。判定与喂狗解耦：健康检查失败期间仍持续喂狗，
@@ -1327,6 +1348,9 @@ func (d *daemon) loop() {
 		d.mu.Lock()
 		if !probeFailed {
 			d.probeEverOK = true
+			d.probeFailCount = 0 // 探针成功：重置失败计数
+		} else {
+			d.probeFailCount++ // 探针失败：递增（UI 展示学习期进度）
 		}
 		probeLearning := cfg.CheckServiceProbe && cfg.ServiceProbeCmd != "" && !d.probeEverOK
 		d.mu.Unlock()
@@ -1352,9 +1376,11 @@ func (d *daemon) loop() {
 			d.mu.Unlock()
 			if fc >= cfg.FailThreshold/2 && fc < cfg.FailThreshold && !warned {
 				if port := probeCandidatePorts(); port > 0 {
-					logf("⚠️ 疑似飞牛管理端口已迁移：探针配置的端口无响应，但端口 %d 有飞牛 Web 响应。这可能是端口变更而非死机！请到页面更新探针命令。本次失败计数清零（防误报）", port)
+					msg := fmt.Sprintf("探针端口无响应但 %d 端口有 Web 响应，可能端口已变更", port)
+					logf("⚠️ 疑似飞牛管理端口已迁移：%s。请到页面更新探针命令。本次失败计数清零（防误报）", msg)
 					d.mu.Lock()
 					d.portWarned = true
+					d.portMigrateInfo = msg
 					d.failCount = 0
 					d.mu.Unlock()
 				}
@@ -1365,6 +1391,7 @@ func (d *daemon) loop() {
 		if allOK {
 			d.failCount = 0
 			d.portWarned = false // 状态恢复后重置端口迁移警告
+			d.portMigrateInfo = "" // 状态恢复后清除端口迁移提示
 		} else {
 			d.failCount++
 		}
@@ -1450,32 +1477,35 @@ func (d *daemon) buildStatus() status {
 		timeoutShown = d.cfg.WatchdogTimeoutSec
 	}
 	return status{
-		Running:            true,
-		Enabled:            enabled,
-		WatchdogOpen:       wd != nil,
-		WatchdogDevice:     watchdogDevice,
-		WatchdogIdentity:   id,
-		WatchdogTimeout:    timeoutShown,
-		WatchdogTimeoutCfg: d.cfg.WatchdogTimeoutSec,
-		Nowayout:           readNowayout(),
-		Version:            appVersion,
-		KernelVersion:      readKernelVersion(),
-		CPUModel:           readCPUModel(),
-		TotalMemoryMB:      readTotalMemoryMB(),
-		Uptime:             readUptime(),
-		CurrentLoad:        d.currentLoad(),
-		DStateCount:        d.dstateCount(),
-		MemoryUsedPct:      usedPct,
-		MemAvailableMB:     availMB,
-		TrendEnabled:       d.cfg.TrendInterval > 0,
-		LastRebootReason:   reason,
-		ConsecutiveFails:   fails,
-		Pid:                os.Getpid(),
-		InBootGrace:        upMin < float64(bootGrace),
-		UpgradeBusy:        busy,
-		BootReason:         d.readBootReasonSummary(),
-		MaintainLeftMin:    maintainLeft,
-		ProbeLearning:      probeOn && !probeEverOK,
+		Running:              true,
+		Enabled:              enabled,
+		WatchdogOpen:         wd != nil,
+		WatchdogDevice:       watchdogDevice,
+		WatchdogIdentity:     id,
+		WatchdogTimeout:      timeoutShown,
+		WatchdogTimeoutCfg:   d.cfg.WatchdogTimeoutSec,
+		Nowayout:             readNowayout(),
+		Version:              appVersion,
+		KernelVersion:        readKernelVersion(),
+		CPUModel:             readCPUModel(),
+		TotalMemoryMB:        readTotalMemoryMB(),
+		Uptime:               readUptime(),
+		CurrentLoad:          d.currentLoad(),
+		DStateCount:          d.dstateCount(),
+		MemoryUsedPct:        usedPct,
+		MemAvailableMB:       availMB,
+		TrendEnabled:         d.cfg.TrendInterval > 0,
+		LastRebootReason:     reason,
+		ConsecutiveFails:     fails,
+		Pid:                  os.Getpid(),
+		InBootGrace:          upMin < float64(bootGrace),
+		UpgradeBusy:          busy,
+		BootReason:           d.readBootReasonSummary(),
+		MaintainLeftMin:      maintainLeft,
+		MaintainUntil:        maintainUntil,
+		ProbeLearning:        probeOn && !probeEverOK,
+		ProbeFailCount:       d.probeFailCount,
+		PortMigrateDetected:  d.portMigrateInfo,
 	}
 }
 
