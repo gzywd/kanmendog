@@ -28,12 +28,18 @@ else
   log "检测到看门狗设备 /dev/watchdog"
 fi
 
-# 3) 内核 lockup 检测 → panic（配合看门狗复位内核级卡死）
+# 3) 内核 lockup 检测 → panic → 自动重启（覆盖单核卡死，用户态健康检查测不到它）
+#    备份原 kernel.panic 值，卸载时恢复，避免永久改变整机的 panic 行为
+PREV_PANIC=$(sysctl -n kernel.panic 2>/dev/null)
+echo "${PREV_PANIC:-0}" > "$PKGETC/prev_kernel_panic" 2>/dev/null || true
 cat > /etc/sysctl.d/99-kanmendog.conf <<'EOF'
-# 由看门狗 KanmenDog 写入：把内核级卡死转化为 panic，触发看门狗复位
+# 由看门狗 KanmenDog 写入：把内核级卡死转化为 panic 并自动重启
 kernel.softlockup_panic = 1
 kernel.hardlockup_panic = 1
 kernel.watchdog_thresh = 20
+# panic 后 10 秒自动重启。若不设，soft/hardlockup 变为 panic 后会停在 panic 屏而不重启，
+# 而这类单核卡死用户态健康检查无法感知，等于唯一兜底链被切断。
+kernel.panic = 10
 EOF
 sysctl -p /etc/sysctl.d/99-kanmendog.conf >/dev/null 2>&1 || true
 

@@ -3,6 +3,7 @@
 set -u
 
 SERVICE="com.gzywd.kanmendog.service"
+PKGETC="${TRIM_PKGETC:-/etc/kanmendog}"
 
 # 先停止服务（若支持 magic close，看门狗会安全解除，不会触发复位）
 systemctl disable --now "$SERVICE" >/dev/null 2>&1
@@ -10,7 +11,14 @@ systemctl disable --now "$SERVICE" >/dev/null 2>&1
 rm -f /etc/systemd/system/"$SERVICE"
 systemctl daemon-reload >/dev/null 2>&1
 
-# 移除内核 lockup 兜底（恢复系统默认行为）
+# 移除内核 lockup 兜底，并恢复 kernel.panic 原值（不强加整机 panic 行为改变）
+if [ -f "$PKGETC/prev_kernel_panic" ]; then
+  PREV=$(cat "$PKGETC/prev_kernel_panic" 2>/dev/null)
+  if [ -n "$PREV" ]; then
+    sysctl -w "kernel.panic=$PREV" >/dev/null 2>&1 || true
+  fi
+  rm -f "$PKGETC/prev_kernel_panic"
+fi
 rm -f /etc/sysctl.d/99-kanmendog.conf
 
 # 注意：保留 PKGVAR 下的日志与 last_reboot_reason，便于事后排查；
