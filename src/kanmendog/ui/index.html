@@ -36,6 +36,7 @@
   button { background:var(--acc); color:#fff; border:none; border-radius:8px; padding:9px 16px; font-size:14px; cursor:pointer; }
   button.ghost { background:#2c3650; }
   button.danger { background:var(--bad); }
+  button.warn { background:var(--warn); color:#000; }
   button:active { transform:translateY(1px); }
   pre { background:#0b0f18; border:1px solid #232c40; border-radius:8px; padding:12px; max-height:320px; overflow:auto; white-space:pre-wrap; word-break:break-all; color:#b8c4da; }
   .toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#2c3650; padding:10px 18px; border-radius:8px; opacity:0; transition:.3s; pointer-events:none; }
@@ -44,6 +45,13 @@
   .muted { color:var(--muted); font-size:12px; }
   .warnbox { background:rgba(245,158,11,.1); border:1px solid rgba(245,158,11,.4); color:var(--warn); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.7; margin:8px 0; }
   .okbox { background:rgba(34,197,94,.08); border:1px solid rgba(34,197,94,.3); color:var(--ok); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.7; margin:8px 0; }
+  .infobox { background:rgba(59,130,246,.08); border:1px solid rgba(59,130,246,.3); color:var(--acc); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.7; margin:8px 0; }
+  .source-card { background:linear-gradient(135deg, rgba(59,130,246,.08), rgba(34,197,94,.05)); border:1px solid rgba(59,130,246,.25); border-radius:10px; padding:14px 16px; margin-bottom:18px; }
+  .source-card .src-title { font-size:12px; color:var(--muted); margin-bottom:4px; }
+  .source-card .src-val { font-size:16px; font-weight:600; }
+  .source-card .src-detail { font-size:12px; color:var(--muted); margin-top:4px; }
+  .maint-bar { display:flex; align-items:center; gap:12px; padding:10px 14px; background:rgba(245,158,11,.06); border:1px solid rgba(245,158,11,.3); border-radius:8px; margin:8px 0; }
+  .maint-bar .countdown { font-size:18px; font-weight:700; color:var(--warn); min-width:60px; text-align:center; }
 </style>
 </head>
 <body>
@@ -52,6 +60,13 @@
   <span class="v" id="ver"></span>
 </header>
 <div class="wrap">
+  <!-- 开机来源标注卡 -->
+  <div class="source-card" id="bootSource" style="display:none">
+    <div class="src-title">📋 本次重启来源</div>
+    <div class="src-val" id="bootSourceVal"></div>
+    <div class="src-detail" id="bootSourceDetail"></div>
+  </div>
+
   <div class="grid" id="stats"></div>
 
   <div class="card">
@@ -63,6 +78,13 @@
       </label>
       <span id="enabledTxt" class="muted"></span>
       <button class="ghost" onclick="refresh()">刷新状态</button>
+    </div>
+    <!-- 手动维护模式 -->
+    <div class="maint-bar" id="maintBar" style="display:none">
+      <span>🔧 维护模式：</span>
+      <span class="countdown" id="maintCountdown">--:--</span>
+      <span class="muted" id="maintHint">期间只喂狗不判定死机</span>
+      <button class="ghost" onclick="cancelMaint()" style="padding:4px 10px;font-size:12px">取消维护</button>
     </div>
     <p class="muted">关闭后看门狗被解除，系统不会自动重启（Web 仍可访问以重新开启）。</p>
   </div>
@@ -86,7 +108,9 @@
     <label><span>可用内存低于该百分比(%)判定异常</span><input type="number" id="mem_available_threshold" min="1" max="100"></label>
     <label><span>趋势日志间隔（周期数，0=关闭）</span><input type="number" id="trend_interval" min="0" max="200"></label>
     <label><span>外部命令探针</span><input type="checkbox" id="check_service_probe"></label>
-    <div class="warnbox">⚠️ <b>开启探针前务必确认：</b>命令中的端口必须是飞牛真实管理端口 —— 新版默认 <b>5666</b>（HTTPS 5667），旧版 8000/8001；<b>80 端口只是可选重定向，可能未开启！</b>端口填错会在约 3 分钟后误判重启系统。安装时已自动探测端口并预填命令，如命令为空请先填好再开启。</div>
+    <div class="warnbox" id="probeWarn">⚠️ <b>开启探针前务必确认：</b>命令中的端口必须是飞牛真实管理端口 —— 新版默认 <b>5666</b>（HTTPS 5667），旧版 8000/8001；<b>80 端口只是可选重定向，可能未开启！</b>端口填错会在约 3 分钟后误判重启系统。安装时已自动探测端口并预填命令，如命令为空请先填好再开启。</div>
+    <div class="infobox" id="probeLearning" style="display:none">📖 探针学习期：前 <b id="learnCount">3</b> 次探测失败不计入判定（适应开机/升级后服务慢启动），之后按正常阈值判定。</div>
+    <div class="warnbox" id="portMigrateWarn" style="display:none">⚠️ <b>检测到探针端口与当前配置端口不一致！</b>探针命令中的端口（<span id="probePortDetected"></span>）可能与飞牛当前实际端口不同，请确认是否需要更新探针命令。</div>
     <label><span>探针命令（返回0即通过）</span><input type="text" id="service_probe_cmd" style="width:280px" placeholder="curl -s -o /dev/null -m 5 http://127.0.0.1:5666/"></label>
     <div class="btns"><button onclick="saveConfig()">保存配置</button><span class="muted">保存即时生效；部分项需重启服务</span></div>
   </div>
@@ -106,8 +130,9 @@
       <button onclick="svc('start')">启动服务</button>
       <button class="ghost" onclick="svc('stop')">停止服务</button>
       <button class="ghost" onclick="svc('restart')">重启服务</button>
+      <button class="warn" onclick="startMaint()">进入维护模式（30分钟）</button>
     </div>
-    <p class="muted">停止服务会关闭整个进程（含本页面），需到飞牛应用中心重新开启。</p>
+    <p class="muted">停止服务会关闭整个进程（含本页面），需到飞牛应用中心重新开启。<b>维护模式</b>期间只喂狗不判定死机，适合手动升级/大文件操作前使用。</p>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -122,7 +147,7 @@ async function refresh(){
   const pill = on => `<span class="pill ${on?'on':'off'}">${on?'运行中':'已停止'}</span>`;
   const wd = s.watchdog_open ? '<span class="pill on">已开启</span>' : '<span class="pill off">未开启</span>';
   const wdId = s.watchdog_identity || 'unknown';
-  const wdKind = wdId==='none' ? '无设备' : (String(wdId).toLowerCase().includes('softdog') ? '软件软狗' : '硬件看门狗');
+  const wdKind = wdId==='none' ? '无设备' : (String(wdId).toLowerCase().includes('softdog') ? '软件看门狗' : '硬件看门狗');
   const memTxt = s.memory_used_pct<0 ? '?' : s.memory_used_pct+'%';
   const availTxt = s.mem_available_mb<0 ? '?' : s.mem_available_mb+' MB';
   $('stats').innerHTML = `
@@ -137,13 +162,59 @@ async function refresh(){
     <div class="stat"><div class="k">进程 PID</div><div class="val">${s.pid}</div></div>
     ${s.upgrade_busy ? `<div class="stat"><div class="k">维护窗口</div><div class="val" style="font-size:13px;color:var(--warn)">${esc(s.upgrade_busy)}</div></div>` : ''}
     ${s.in_boot_grace ? `<div class="stat"><div class="k">开机冷却期</div><div class="val" style="font-size:13px;color:var(--warn)">冷却中（不判定）</div></div>` : ''}`;
+
+  // 开机来源标注
+  if (s.boot_source) {
+    $('bootSource').style.display = '';
+    const srcMap = {
+      'watchdog': ['⚠️ 看门狗判定死机', '系统因连续异常被看门狗自动重启，详情见日志。', 'color:var(--bad)'],
+      'hardware_reset': ['🔌 硬件看门狗复位', '全核冻结导致硬件看门狗超时复位（进程无法写日志），属最后兜底机制。', 'color:var(--bad)'],
+      'kernel_panic': ['💥 内核 panic', '内核检测到硬锁死(hard lockup)触发 panic→reboot。', 'color:var(--bad)'],
+      'normal_shutdown': ['✅ 正常关机/重启', '上次为用户主动关机或 reboot 命令重启，无异常。', 'color:var(--ok)'],
+      'unknown': ['❓ 来源不明', '无法确定上次重启原因，可能为首次安装或日志已被清理。', 'color:var(--warn)'],
+    };
+    const info = srcMap[s.boot_source] || srcMap['unknown'];
+    $('bootSourceVal').textContent = info[0];
+    $('bootSourceVal').style.color = info[2];
+    $('bootSourceDetail').textContent = info[1];
+    if (s.boot_source_detail) $('bootSourceDetail').textContent += ' '+s.boot_source_detail;
+  } else {
+    $('bootSource').style.display = 'none';
+  }
+
+  // 手动维护模式
+  if (s.maintain_until && s.maintain_until > 0) {
+    $('maintBar').style.display = '';
+    updateCountdown(s.maintain_until);
+  } else {
+    $('maintBar').style.display = 'none';
+  }
+
+  // 探针学习期
+  if (s.check_service_probe && s.probe_fail_count !== undefined && s.probe_fail_count < 3) {
+    $('probeLearning').style.display = '';
+    $('learnCount').textContent = (3 - s.probe_fail_count);
+  } else {
+    $('probeLearning').style.display = 'none';
+  }
+
+  // 端口迁移检测
+  if (s.port_migrate_detected) {
+    $('portMigrateWarn').style.display = '';
+    $('probePortDetected').textContent = s.port_migrate_detected;
+  } else {
+    $('portMigrateWarn').style.display = 'none';
+  }
+
   $('enabledSw').checked = s.enabled;
   let mode = s.enabled ? '监控进行中，连续异常达阈值将自动重启' : '监控已暂停';
   if (s.in_boot_grace) mode = '开机冷却期内：只喂狗不判定（防开机误判）';
   if (s.upgrade_busy) mode = '维护窗口：' + s.upgrade_busy + '（继续喂狗，不判定）';
+  if (s.maintain_until && s.maintain_until > 0) mode = '手动维护模式：只喂狗不判定';
   $('enabledTxt').textContent = mode;
   if (s.last_reboot_reason) $('stats').insertAdjacentHTML('beforeend',
     `<div class="stat"><div class="k">上次重启原因</div><div class="val" style="font-size:13px">${esc(s.last_reboot_reason.split('\n')[1]||s.last_reboot_reason)}</div></div>`);
+
   const c = await (await fetch('/api/config')).json();
   for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','boot_grace_min','port','load_threshold','dstate_threshold','mem_available_threshold','trend_interval'])
     $(k).value = c[k];
@@ -152,6 +223,29 @@ async function refresh(){
   $('service_probe_cmd').value = c.service_probe_cmd || '';
 }
 function esc(s){ return (s||'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
+
+// 维护模式倒计时
+let maintTimer = null;
+function updateCountdown(unixSec){
+  if (maintTimer) clearInterval(maintTimer);
+  maintTimer = setInterval(()=>{
+    const left = Math.max(0, unixSec - Math.floor(Date.now()/1000));
+    if (left <= 0) { $('maintBar').style.display='none'; clearInterval(maintTimer); return; }
+    const m = Math.floor(left/60), sec = left%60;
+    $('maintCountdown').textContent = String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');
+  }, 1000);
+}
+
+async function startMaint(){
+  const r = await fetch('/api/maintain?minutes=30',{method:'POST'});
+  if (r.ok) { toast('已进入维护模式（30分钟）'); refresh(); }
+  else toast('操作失败');
+}
+async function cancelMaint(){
+  const r = await fetch('/api/maintain?minutes=0',{method:'POST'});
+  if (r.ok) { toast('已取消维护模式'); refresh(); }
+  else toast('操作失败');
+}
 
 async function saveConfig(){
   const c = {};
