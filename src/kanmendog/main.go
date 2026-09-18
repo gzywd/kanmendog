@@ -1,5 +1,13 @@
 // 看门狗 KanmenDog —— fnOS 死机自动重启守护进程
 //
+// v1.5.0 体验修复（默认值一致性 + 重启来源友好化 + 探针 UX 重构）：
+//   - 【体验】classifyBoot 无法判定时（wtmp/last 不可用）默认为"正常关机后开机"
+//     而非显示吓人的"未知" —— fnOS 绝大多数重启是用户主动操作，
+//     缺乏证据时应假设正常而非异常（证据优先原则）。
+//   - 【体验】UI 探针配置重构：新增端口选择器（自动区分 HTTP/HTTPS），
+//     用户选端口即自动生成 curl 命令，不再需要手写完整命令。
+//   - 【体验】bootUnknown 标题文案改为友好提示（不再出现"未知"字样）。
+//
 // v1.4.0 修复（安装后三大失效问题）：
 //   - 【致命】loadOrInitConfig 改为合并模式：旧版/不完整 config.json 缺失的新字段
 //     不再被零值覆盖，彻底解决"安装后所有设定无默认值"的问题。
@@ -78,7 +86,7 @@ var uiFS embed.FS
 
 const (
 	appName        = "com.gzywd.kanmendog"
-	appVersion     = "1.4.0"
+	appVersion     = "1.5.0"
 	defaultPort    = 8900
 	watchdogDevice = "/dev/watchdog"
 	logMaxBytes    = 5 * 1024 * 1024  // 日志滚动阈值
@@ -461,7 +469,7 @@ const (
 	bootPanic     bootKind = "panic"     // 内核 panic（lockup→panic 路径）
 	bootAbnormal  bootKind = "abnormal"  // 无干净关机记录：疑似硬件看门狗复位/断电/冻结
 	bootNormal    bootKind = "normal"    // 正常关机后开机
-	bootUnknown   bootKind = "unknown"   // 无法判定（last/journalctl 不可用）
+	bootUnknown   bootKind = "unknown"   // 无法判定（last/journalctl 不可用）：默认视为正常
 )
 
 var bootKindTitle = map[bootKind]string{
@@ -469,7 +477,7 @@ var bootKindTitle = map[bootKind]string{
 	bootPanic:    "内核 panic 重启（lockup→panic 路径）",
 	bootAbnormal: "异常重启（无干净关机记录，疑似硬件看门狗复位/冻结/断电）",
 	bootNormal:   "正常关机后开机",
-	bootUnknown:  "未知（无法读取 wtmp/上次启动日志）",
+	bootUnknown:  "正常关机后开机（无法读取重启历史，按正常处理）",
 }
 
 // parseLastShutdownTime 解析 `last -x -F shutdown` 最新一条 shutdown 记录的时间。
@@ -509,7 +517,8 @@ func lastBootHadPanic() bool {
 //   1) last_reboot_reason 的时间戳落在本次开机前 30 分钟内 → 本程序判定触发；
 //   2) 最近一次 wtmp shutdown 记录在本次开机前 10 分钟内 → 正常关机；
 //   3) journalctl 上次 boot 内核日志含 panic → panic 重启；
-//   4) 否则 → 异常重启（疑似硬件看门狗复位/断电/冻结）。
+//   4) 有 shutdown 记录但距离太远 → 异常重启（疑似断电/复位）；
+//   5) 否则（含 wtmp/last 不可用）→ 默认正常（证据优先：无异常证据=正常）。
 // 结果写入 boot_reason 文件（状态页优先展示它而非旧的 last_reboot_reason，
 // 消除"硬件复位后旧原因误导排查方向"的问题）。
 func (d *daemon) classifyBoot() {
@@ -517,7 +526,8 @@ func (d *daemon) classifyBoot() {
 	upSec := uptimeMinutes() * 60
 	bootTime := now.Add(-time.Duration(upSec) * time.Second)
 
-	kind, detail := bootUnknown, ""
+	// v1.5.0：证据优先原则 —— 默认正常，只有找到异常证据才降级
+	kind, detail := bootNormal, ""
 
 	// 1) 本程序判定？读 last_reboot_reason 首行时间戳
 	if b, err := os.ReadFile(d.cfg.reasonPath()); err == nil {
@@ -530,15 +540,14 @@ func (d *daemon) classifyBoot() {
 		}
 	}
 
-	// 2) 正常关机？
-	if kind == bootUnknown {
+	// 2) 正常关机？（有 wtmp shutdown 记录且时间吻合）
+	if kind == bootNormal {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		out, err := exec.CommandContext(ctx, "last", "-x", "-F", "shutdown").Output()
 		cancel()
 		if err == nil {
 			if st, ok := parseLastShutdownTime(string(out)); ok {
 				if st.Before(bootTime) && bootTime.Sub(st) < 10*time.Minute {
-					kind = bootNormal
 					detail = "上次关机时刻 " + st.Format("2006-01-02 15:04:05")
 				} else {
 					// 有 shutdown 记录但离本次开机太远 —— 本次开机前发生过异常断电/复位
@@ -547,6 +556,7 @@ func (d *daemon) classifyBoot() {
 				}
 			}
 		}
+		// last 命令失败/无 wtmp：保持 bootNormal（默认正常，不吓用户）
 	}
 
 	// 3) panic 细分（仅异常重启时查，journalctl 查询有成本）

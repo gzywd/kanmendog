@@ -125,11 +125,23 @@
     <label><span>内存可用率检查（防 OOM 死机）</span><input type="checkbox" id="check_memory"></label>
     <label><span>可用内存低于该百分比(%)判定异常</span><input type="number" id="mem_available_threshold" min="1" max="100"></label>
     <label><span>趋势日志间隔（周期数，0=关闭）</span><input type="number" id="trend_interval" min="0" max="200"></label>
-    <label><span>外部命令探针</span><input type="checkbox" id="check_service_probe"></label>
-    <div class="warnbox" id="probeWarn">⚠️ <b>开启探针前务必确认：</b>命令中的端口必须是飞牛真实管理端口 —— 新版默认 <b>5666</b>（HTTPS 5667），旧版 8000/8001；<b>80 端口只是可选重定向，可能未开启！</b>端口填错会在约 3 分钟后误判重启系统。安装时已自动探测端口并预填命令，如命令为空请先填好再开启。</div>
+    <label><span>外部命令探针（检测飞牛Web是否可达，默认关）</span><input type="checkbox" id="check_service_probe"></label>
+    <div class="warnbox" id="probeWarn">⚠️ <b>探针说明：</b>用于检测飞牛管理界面是否还能正常访问。新版飞牛默认端口 <b>5666</b>（HTTPS 5667），旧版 8000/8001；<b>80 端口只是可选重定向，可能未开启！</b>下方选择端口后自动生成探测命令，无需手写。安装时已自动探测并预填。</div>
     <div class="infobox" id="probeLearning" style="display:none">📖 探针学习期：前 <b id="learnCount">3</b> 次探测失败不计入判定（适应开机/升级后服务慢启动），之后按正常阈值判定。</div>
     <div class="warnbox" id="portMigrateWarn" style="display:none">⚠️ <b>检测到探针端口与当前配置端口不一致！</b>探针命令中的端口（<span id="probePortDetected"></span>）可能与飞牛当前实际端口不同，请确认是否需要更新探针命令。</div>
-    <label><span>探针命令（返回0即通过）</span><input type="text" id="service_probe_cmd" style="width:280px" placeholder="curl -s -o /dev/null -m 5 http://127.0.0.1:5666/"></label>
+    <label><span>飞牛管理端口（选端口后自动生成探针命令）</span>
+      <select id="probe_port" style="width:160px;background:#0f1420;border:1px solid #2c3650;color:var(--fg);border-radius:7px;padding:6px 9px;">
+        <option value="">-- 探测/手动填写 --</option>
+        <option value="5666">5666（新版默认 HTTP）</option>
+        <option value="5667">5667（新版 HTTPS）</option>
+        <option value="8000">8000（旧版 HTTP）</option>
+        <option value="8001">8001（旧版 HTTPS）</option>
+        <option value="80">80（HTTP 重定向）</option>
+        <option value="443">443（HTTPS）</option>
+      </select>
+      <span class="muted" id="probeSchemeHint" style="margin-left:8px"></span>
+    </label>
+    <label><span>探针命令（自动生成，也可手动修改）</span><input type="text" id="service_probe_cmd" style="width:360px" placeholder="选择上方端口自动生成，或手动输入 curl 命令"></label>
     <div class="btns"><button onclick="saveConfig()">保存配置</button><span class="muted">保存即时生效；部分项需重启服务</span></div>
   </div>
 
@@ -220,12 +232,12 @@ function renderStatus(s){
   if (s.boot_reason) {
     $('bootSource').style.display = '';
     const title = s.boot_reason;
-    let desc = '', color = 'var(--warn)';
+    let desc = '', color = 'var(--ok)'; // v1.5.0：默认绿色（正常）
     if (title.includes('本程序判定')) { desc = '系统因连续异常被看门狗自动重启。'; color = 'var(--bad)'; }
     else if (title.includes('异常重启') || title.includes('硬件')) { desc = '无干净关机记录，疑似硬件复位/断电/全核冻结。'; color = 'var(--bad)'; }
     else if (title.includes('panic')) { desc = '内核 hard lockup 触发 panic→reboot。'; color = 'var(--bad)'; }
-    else if (title.includes('正常关机')) { desc = '用户主动关机或 reboot，无异常。'; color = 'var(--ok)'; }
-    else { desc = '详见日志中的开机自检记录。'; }
+    else if (title.includes('正常关机')) { desc = '用户主动关机或 reboot，系统运行正常。'; color = 'var(--ok)'; }
+    else { desc = '系统运行正常，未检测到异常重启。'; color = 'var(--ok)'; }
     $('bootSourceVal').textContent = title;
     $('bootSourceVal').style.color = color;
     $('bootSourceDetail').textContent = desc;
@@ -279,6 +291,74 @@ function renderConfig(c){
     $(k).checked = !!c[k];
   }
   $('service_probe_cmd').value = c.service_probe_cmd || '';
+  // v1.5.0：从现有命令反推端口选择器状态
+  syncProbePortFromCmd(c.service_probe_cmd || '');
+}
+
+// ---- v1.5.0 探针端口选择器逻辑 ----
+
+// HTTPS 端口集合（用于判断协议）
+const HTTPS_PORTS = new Set([5667, 8001, 443]);
+
+// 根据端口号生成 curl 探针命令
+function generateProbeCmd(port) {
+  if (!port) return '';
+  const p = parseInt(port, 10);
+  if (HTTPS_PORTS.has(p)) {
+    return 'curl -sk -o /dev/null -m 5 https://127.0.0.1:' + p + '/';
+  }
+  return 'curl -s -o /dev/null -m 5 http://127.0.0.1:' + p + '/';
+}
+
+// 从现有 curl 命令中提取端口号
+function extractPortFromCmd(cmd) {
+  if (!cmd) return '';
+  // 匹配 http(s)://127.0.0.1:PORT/ 或 http(s)://localhost:PORT/
+  const m = cmd.match(/https?:\/\/(?:127\.0\.0\.1|localhost):(\d+)\//i);
+  return m ? m[1] : '';
+}
+
+// 端口选择器变更 → 自动生成探针命令
+$('probe_port').addEventListener('change', function(){
+  const port = this.value;
+  const cmd = generateProbeCmd(port);
+  if (cmd) {
+    $('service_probe_cmd').value = cmd;
+    // 显示协议提示
+    if (HTTPS_PORTS.has(parseInt(port, 10))) {
+      $('probeSchemeHint').textContent = '✅ HTTPS（-sk 跳过证书验证）';
+      $('probeSchemeHint').style.color = 'var(--ok)';
+    } else {
+      $('probeSchemeHint').textContent = '✅ HTTP';
+      $('probeSchemeHint').style.color = 'var(--ok)';
+    }
+  } else {
+    $('probeSchemeHint').textContent = '请手动输入探针命令';
+    $('probeSchemeHint').style.color = 'var(--warn)';
+  }
+});
+
+// 从现有命令同步端口选择器状态（页面加载时调用）
+function syncProbePortFromCmd(cmd) {
+  const port = extractPortFromCmd(cmd);
+  if (port && $('probe_port').querySelector('value="' + port + '"')) {
+    $('probe_port').value = port;
+    // 触发一次提示更新
+    if (HTTPS_PORTS.has(parseInt(port, 10))) {
+      $('probeSchemeHint').textContent = '✅ 当前使用 HTTPS';
+      $('probeSchemeHint').style.color = 'var(--ok)';
+    } else if (port) {
+      $('probeSchemeHint').textContent = '✅ 当前使用 HTTP';
+      $('probeSchemeHint').style.color = 'var(--ok)';
+    }
+  } else if (cmd) {
+    // 命令存在但无法识别端口（可能是自定义命令）
+    $('probe_port').value = '';
+    $('probeSchemeHint').textContent = '⚠️ 自定义命令，已跳过端口选择器';
+    $('probeSchemeHint').style.color = 'var(--warn)';
+  } else {
+    $('probeSchemeHint').textContent = '';
+  }
 }
 function esc(s){ return (s||'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
 
