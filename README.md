@@ -51,14 +51,19 @@
 
 ## 安装（飞牛 fnOS 测试设备）
 
-1. 下载 Release 中的 `kanmendog-1.0.0.fpk`。
-2. 飞牛应用中心 → 手动安装（本地 `.fpk`）→ 安装。
-   或开发者方式：
-   ```bash
-   appcenter-cli install-local kanmendog-1.0.0.fpk
-   appcenter-cli start com.gzywd.kanmendog
-   ```
-3. 桌面打开"看门狗 KanmenDog"进行配置与监控。
+获取 `.fpk` 两种方式：
+
+- **仓库根目录预编译包**：`com.gzywd.kanmendog.fpk`（随源码一同提交，可直接下载安装）。
+- **GitHub Release**：在仓库 Releases 页下载（若已发布；标签 `v1.0.0` 已打）。
+
+飞牛应用中心 → 手动安装（本地 `.fpk`）→ 安装。或开发者方式：
+
+```bash
+appcenter-cli install-local com.gzywd.kanmendog.fpk
+appcenter-cli start com.gzywd.kanmendog
+```
+
+桌面打开"看门狗 KanmenDog"进行配置与监控。
 
 > 建议先在**无重要数据的测试机**上验证，确认各项阈值适合你的负载后再长期开启自动重启。
 
