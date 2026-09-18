@@ -1,7 +1,6 @@
 #!/bin/bash
 # cmd/install_callback —— 安装文件应用后执行：加载看门狗、写内核 lockup 兜底、注册 systemd 服务
-# v1.3.2：零误杀+可追溯+硬件信息+UI修复 —— sysctl 保守化+全量备份、fnOS 管理端口自动探测、
-#         优雅退出单元、wizard 探针知情选择联动、auto_reboot 开关修正、status API 字段补全
+# v1.4.0：安装后三大失效修复 —— 配置合并模式+UI错误处理+服务控制兼容+启动优化
 set -u
 
 APPDEST="${TRIM_APPDEST:-/var/apps/com.gzywd.kanmendog/target}"

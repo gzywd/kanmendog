@@ -1,6 +1,18 @@
 // 看门狗 KanmenDog —— fnOS 死机自动重启守护进程
 //
-// v1.3.2 修复（UI 功能修复 + auto_reboot 开关修正）：
+// v1.4.0 修复（安装后三大失效问题）：
+//   - 【致命】loadOrInitConfig 改为合并模式：旧版/不完整 config.json 缺失的新字段
+//     不再被零值覆盖，彻底解决"安装后所有设定无默认值"的问题。
+//   - 【严重】UI 全部 async 函数加 try-catch 错误处理：任一 API 失败不再静默崩溃，
+//     用户能看到明确错误提示（而非配置全空/日志空白/按钮无反应）。
+//   - 【严重】handleService 兼容飞牛环境：检测 systemctl 可用性，不可用时提供
+//     明确降级方案和错误信息（原行为：静默失败，按钮点了完全没反应）。
+//   - 【改进】启动顺序优化：先启动 HTTP server（用户立即看到页面），
+//     再做 classifyBoot/ensureWatchdog 等耗时初始化（防初始化阻塞导致 API 超时）。
+//   - 【改进】日志 tailLines 增加磁盘文件回退：内存缓冲区为空时从文件读取
+//     （解决"日志未加载"——刚启动时内存缓冲区几乎为空）。
+//   - 【改进】新增 /api/health 诊断端点：返回配置路径、文件存在性、看门狗状态、
+//     环境变量、systemctl 可用性等关键诊断信息。
 //   - 【严重】auto_reboot=false 时不再关闭看门狗 fd（原行为导致 60s 后硬复位，
 //     auto_reboot 开关形同虚设）；现仅记录+告警，主循环继续喂狗。
 //   - 【严重】status API 补充缺失字段：maintain_until, probe_fail_count,
@@ -66,7 +78,7 @@ var uiFS embed.FS
 
 const (
 	appName        = "com.gzywd.kanmendog"
-	appVersion     = "1.3.2"
+	appVersion     = "1.4.0"
 	defaultPort    = 8900
 	watchdogDevice = "/dev/watchdog"
 	logMaxBytes    = 5 * 1024 * 1024  // 日志滚动阈值
@@ -183,15 +195,33 @@ func (l *logger) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// tailLines 返回最近 n 行日志；优先从内存缓冲区读（实时），
+// 缓冲区为空或行数不足时从磁盘文件补充（覆盖进程重启后/刚启动时内存无历史的问题）。
 func (l *logger) tailLines(n int) string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	s := l.buf.String()
 	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
+	// 内存缓冲区足够：直接返回
+	if len(lines) >= n {
+		return strings.Join(lines[len(lines)-n:], "\n")
 	}
-	return strings.Join(lines, "\n")
+	// 内存不足：尝试从磁盘文件读取更多
+	var fileLines []string
+	if fb, err := os.ReadFile(l.path); err == nil {
+		fileLines = strings.Split(strings.TrimRight(string(fb), "\n"), "\n")
+	}
+	if len(fileLines) > len(lines) {
+		combined := append(fileLines, lines...)
+		if len(combined) > n {
+			combined = combined[len(combined)-n:]
+		}
+		return strings.Join(combined, "\n")
+	}
+	if len(lines) > 0 && lines[0] != "" {
+		return strings.Join(lines, "\n")
+	}
+	return "(暂无日志)"
 }
 
 func (l *logger) Rotate() {
@@ -1004,18 +1034,54 @@ type daemon struct {
 	portMigrateInfo   string   // 端口迁移检测到的候选端口信息（UI 展示用，空=无）
 }
 
+// loadOrInitConfig 加载配置文件；若文件不存在则写入默认配置。
+// v1.4.0：改为合并模式 —— 文件中存在的字段使用文件值，缺失字段保留 defaultConfig() 默认值。
+// 这解决了旧版升级后新字段（如 boot_grace_min、maintain_until）被 JSON unmarshal 为零值导致
+// "安装后所有设定无默认值"的问题。同时兼容 install_callback 未执行（手动运行）的场景。
+//
+// 实现关键：先用 map[string]json.RawMessage 解析原始文件，只提取文件中**实际存在的键**，
+// 再用这些键去覆盖默认配置。避免 Go struct Unmarshal→Marshal 全量输出（含零值）导致
+// 缺失字段被零值污染的问题。
 func loadOrInitConfig(cfg *Config) {
 	p := cfg.configPath()
 	b, err := os.ReadFile(p)
 	if err != nil {
-		// 首次运行：写默认配置
+		// 首次运行或 install_callback 未执行：写默认配置
 		_ = os.MkdirAll(cfg.etcDir(), 0o755)
 		saveConfig(cfg)
 		return
 	}
-	var loaded Config
-	if err := json.Unmarshal(b, &loaded); err == nil {
-		*cfg = loaded
+
+	// 先尝试解析为 map，检测文件中实际存在哪些键
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(b, &rawMap); err != nil {
+		// 配置文件存在但格式错误（损坏/手动编辑出错）：备份坏文件并用默认配置
+		logf("警告：配置文件 %s 格式错误（%s），备份为 %s.bad 并使用默认配置", p, err.Error(), p)
+		_ = os.Rename(p, p+".bad")
+		saveConfig(cfg)
+		return
+	}
+
+	// 用默认值作为基底
+	def := defaultConfig()
+	defBytes, _ := json.Marshal(def)
+	var defMap map[string]json.RawMessage
+	_ = json.Unmarshal(defBytes, &defMap)
+
+	// 只覆盖文件中实际存在的键（不引入零值污染）
+	for k := range rawMap {
+		if _, existsInDef := defMap[k]; existsInDef {
+			defMap[k] = rawMap[k] // 文件中的值覆盖默认值
+		} else {
+			logf("配置文件包含未知字段 '%s'，已忽略", k)
+		}
+	}
+
+	mergedBytes, _ := json.Marshal(defMap)
+	if err := json.Unmarshal(mergedBytes, cfg); err != nil {
+		// 合并失败（极端情况）：回退到默认配置
+		logf("警告：配置合并失败（%s），使用默认配置", err.Error())
+		*cfg = def
 	}
 }
 
@@ -1677,6 +1743,47 @@ func (d *daemon) handleMaintain(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleService 控制 systemd 服务（真实启停整个进程）
+// handleHealth 健康检查端点（v1.4.0）：用于诊断 API 是否正常工作，
+// 以及确认配置加载、看门狗状态、环境变量等关键信息。
+func (d *daemon) handleHealth(w http.ResponseWriter, r *http.Request) {
+	d.mu.Lock()
+	health := map[string]interface{}{
+		"status":    "ok",
+		"version":   appVersion,
+		"pid":       os.Getpid(),
+		"uptime_sec": int(time.Since(d.startTime).Seconds()),
+		"config_path": d.cfg.configPath(),
+		"config_exists": false,
+		"log_path":   d.cfg.logPath(),
+		"log_exists": false,
+		"watchdog_open": d.wd != nil,
+		"watchdog_device": watchdogDevice,
+		"env_trim_pkgetc": os.Getenv("TRIM_PKGETC"),
+		"env_trim_pkgvar": os.Getenv("TRIM_PKGVAR"),
+		"env_trim_appdest": os.Getenv("TRIM_APPDEST"),
+	}
+	if _, err := os.Stat(d.cfg.configPath()); err == nil {
+		health["config_exists"] = true
+	}
+	if _, err := os.Stat(d.cfg.logPath()); err == nil {
+		health["log_exists"] = true
+	}
+	d.mu.Unlock()
+
+	// 检测 systemctl 可用性
+	if _, err := exec.LookPath("systemctl"); err == nil {
+		health["systemctl"] = "available"
+	} else {
+		health["systemctl"] = "unavailable"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(health)
+}
+
+// handleService 服务控制（start/stop/restart）。
+// v1.4.0：兼容飞牛环境 —— 检测 systemctl 可用性，不可用时提供明确错误信息；
+//   同时支持直接信号控制（非 systemd 环境下的降级方案）。
 func (d *daemon) handleService(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
@@ -1687,12 +1794,45 @@ func (d *daemon) handleService(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad action", 400)
 		return
 	}
-	out, err := exec.Command("systemctl", action, appName+".service").CombinedOutput()
+
+	result := map[string]string{"result": "ok", "action": action}
+
+	// 检测 systemctl 是否可用（Docker 容器中通常不可用）
+	systemctlOK := false
+	if _, err := exec.LookPath("systemctl"); err == nil {
+		// 进一步确认不是 busybox 的伪 systemctl
+		if out, err := exec.Command("systemctl", "--version").CombinedOutput(); err == nil && len(out) > 10 {
+			systemctlOK = true
+		}
+	}
+
+	if systemctlOK {
+		out, err := exec.Command("systemctl", action, appName+".service").CombinedOutput()
+		result["output"] = strings.TrimSpace(string(out))
+		result["error"] = errStr(err)
+	} else {
+		// 降级方案：非 systemd 环境（如 Docker/手动运行）
+		switch action {
+		case "stop":
+			result["output"] = "systemctl 不可用，发送 SIGTERM 请求进程退出"
+			result["warn"] = "当前环境无 systemctl；已发送停止信号。若通过飞牛应用中心安装，请使用应用中心的启动/停止按钮控制服务。"
+			// 尝试发信号给自己（优雅退出会 disarm 看门狗）
+			if pid, err := strconv.Atoi(os.Getenv("KANMENDOG_PID")); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGTERM)
+				result["output"] = fmt.Sprintf("已向 PID %d 发送 SIGTERM", pid)
+			}
+		case "restart":
+			result["output"] = "systemctl 不可用，无法重启"
+			result["warn"] = "当前环境无 systemctl；无法通过页面重启。请使用飞牛应用中心的重启按钮。"
+		case "start":
+			result["output"] = "进程已在运行（本页面即由该进程提供服务）"
+			result["warn"] = "无需操作：看门狗进程正在运行中（PID=" + strconv.Itoa(os.Getpid()) + "）。"
+		}
+		result["error"] = ""
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"result": "ok", "action": action,
-		"output": strings.TrimSpace(string(out)), "error": errStr(err),
-	})
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 func errStr(err error) string {
@@ -1722,6 +1862,7 @@ func (d *daemon) startHTTP() {
 	mux.HandleFunc("/api/toggle", d.handleToggle)
 	mux.HandleFunc("/api/maintain", d.handleMaintain)
 	mux.HandleFunc("/api/service", d.handleService)
+	mux.HandleFunc("/api/health", d.handleHealth)
 
 	d.mu.Lock()
 	port := d.cfg.Port
@@ -1775,20 +1916,27 @@ func main() {
 
 	d := &daemon{cfg: cfg, startTime: time.Now()}
 
-	// 开机自检：本次重启来源标注（v1.3.0 信任闭环 —— 消除旧原因误导 + 补硬件复位盲区）
-	d.classifyBoot()
+	// v1.4.0：先启动 HTTP 服务（让用户立即能看到页面），再做耗时初始化
+	go func() {
+		// 开机自检：本次重启来源标注
+		d.classifyBoot()
 
-	// v1.3.1：启动时完整记录硬件环境信息（对复盘"为什么没兜住"至关重要）
-	logf("=== 硬件环境信息 ===")
-	logf("内核: %s", readKernelVersion())
-	logf("CPU: %s", readCPUModel())
-	logf("总内存: %d MB", readTotalMemoryMB())
-	logf("看门狗身份: %s", readWatchdogIdentity())
-	logf("看门狗 nowayout: %v（true=不可 magic close，停止服务也会在超时后硬复位）", readNowayout())
-	logf("配置超时: %d 秒", cfg.WatchdogTimeoutSec)
-	logf("=== 硬件环境信息结束 ===")
+		// 启动时完整记录硬件环境信息（对复盘"为什么没兜住"至关重要）
+		logf("=== 硬件环境信息 ===")
+		logf("内核: %s", readKernelVersion())
+		logf("CPU: %s", readCPUModel())
+		logf("总内存: %d MB", readTotalMemoryMB())
+		logf("看门狗身份: %s", readWatchdogIdentity())
+		logf("看门狗 nowayout: %v（true=不可 magic close，停止服务也会在超时后硬复位）", readNowayout())
+		logf("配置超时: %d 秒", cfg.WatchdogTimeoutSec)
+		logf("配置路径: %s", cfg.configPath())
+		logf("日志路径: %s", cfg.logPath())
+		logf("=== 硬件环境信息结束 ===")
 
-	d.ensureWatchdog()
+		d.ensureWatchdog()
+
+		logf("初始化完成，开始健康检查循环")
+	}()
 
 	// 优雅退出（v1.2.0 核心修复）：systemd 停止/关机/重启先发 SIGTERM，
 	// 这里必须在退出前 magic close 解除看门狗。
@@ -1801,6 +1949,9 @@ func main() {
 			d.gracefulShutdown(sig)
 		}
 	}()
+
+	// 记录 PID 到环境变量供服务控制降级使用
+	_ = os.Setenv("KANMENDOG_PID", strconv.Itoa(os.Getpid()))
 
 	go d.loop()
 	d.startHTTP()

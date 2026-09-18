@@ -39,13 +39,14 @@
   button.warn { background:var(--warn); color:#000; }
   button:active { transform:translateY(1px); }
   pre { background:#0b0f18; border:1px solid #232c40; border-radius:8px; padding:12px; max-height:320px; overflow:auto; white-space:pre-wrap; word-break:break-all; color:#b8c4da; }
-  .toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#2c3650; padding:10px 18px; border-radius:8px; opacity:0; transition:.3s; pointer-events:none; }
+  .toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#2c3650; padding:10px 18px; border-radius:8px; opacity:0; transition:.3s; pointer-events:none; z-index:999; }
   .toast.show { opacity:1; }
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .muted { color:var(--muted); font-size:12px; }
   .warnbox { background:rgba(245,158,11,.1); border:1px solid rgba(245,158,11,.4); color:var(--warn); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.7; margin:8px 0; }
   .okbox { background:rgba(34,197,94,.08); border:1px solid rgba(34,197,94,.3); color:var(--ok); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.7; margin:8px 0; }
   .infobox { background:rgba(59,130,246,.08); border:1px solid rgba(59,130,246,.3); color:var(--acc); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.7; margin:8px 0; }
+  .errbox { background:rgba(239,68,68,.08); border:1px solid rgba(239,68,68,.3); color:var(--bad); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.7; margin:8px 0; }
   .source-card { background:linear-gradient(135deg, rgba(59,130,246,.08), rgba(34,197,94,.05)); border:1px solid rgba(59,130,246,.25); border-radius:10px; padding:14px 16px; margin-bottom:18px; }
   .source-card .src-title { font-size:12px; color:var(--muted); margin-bottom:4px; }
   .source-card .src-val { font-size:16px; font-weight:600; }
@@ -75,6 +76,13 @@
   <div class="source-card" id="hwInfo" style="display:none">
     <div class="src-title">🖥️ 硬件环境</div>
     <div id="hwInfoBody"></div>
+  </div>
+
+  <!-- 错误提示区（v1.4.0 新增） -->
+  <div class="errbox" id="globalErr" style="display:none">
+    <b>⚠️ 页面加载异常：</b><span id="globalErrTxt"></span>
+    <br>请检查服务是否正常运行，或刷新页面重试。
+    <br><button class="ghost" style="margin-top:6px" onclick="checkHealth()">诊断连接</button>
   </div>
 
   <div class="grid" id="stats"></div>
@@ -143,6 +151,7 @@
       <button class="warn" onclick="startMaint()">进入维护模式（30分钟）</button>
     </div>
     <p class="muted">停止服务会关闭整个进程（含本页面），需到飞牛应用中心重新开启。<b>维护模式</b>期间只喂狗不判定死机，适合手动升级/大文件操作前使用。</p>
+    <div id="svcResult" class="infobox" style="display:none"></div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -151,8 +160,31 @@
 const $ = id => document.getElementById(id);
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2200); }
 
+// v1.4.0：全局错误展示
+function showGlobalErr(msg){
+  $('globalErrTxt').textContent = msg;
+  $('globalErr').style.display = '';
+  console.error('[KanmenDog UI Error]', msg);
+}
+
 async function refresh(){
-  const s = await (await fetch('/api/status')).json();
+  try {
+    const s = await (await fetch('/api/status')).json();
+    renderStatus(s);
+  } catch(e) {
+    showGlobalErr('获取状态失败: ' + e.message + '（服务可能未正常启动）');
+    return;
+  }
+
+  try {
+    const c = await (await fetch('/api/config')).json();
+    renderConfig(c);
+  } catch(e) {
+    showGlobalErr('获取配置失败: ' + e.message + '（配置文件可能损坏或未初始化）');
+  }
+}
+
+function renderStatus(s){
   $('ver').textContent = 'v'+s.version;
   const pill = on => `<span class="pill ${on?'on':'off'}">${on?'运行中':'已停止'}</span>`;
   const wd = s.watchdog_open ? '<span class="pill on">已开启</span>' : '<span class="pill off">未开启</span>';
@@ -163,7 +195,7 @@ async function refresh(){
   $('stats').innerHTML = `
     <div class="stat"><div class="k">监控状态</div><div class="val">${pill(s.enabled)}</div></div>
     <div class="stat"><div class="k">看门狗</div><div class="val">${wd}<div class="muted" style="font-size:11px">${wdKind} | ${wdId}</div></div></div>
-    <div class="stat"><div class="k">看门狗超时</div><div class="val">${s.watchdog_timeout}s<div class="muted" style="font-size:11px">配置 ${s.watchdog_timeout_cfg}s${s.watchdog_timeout!==s.watchdog_timeout_cfg?' ⚠️被驱动调整':'')}</div></div></div>
+    <div class="stat"><div class="k">看门狗超时</div><div class="val">${s.watchdog_timeout}s<div class="muted" style="font-size:11px">配置 ${s.watchdog_timeout_cfg}s${s.watchdog_timeout!==s.watchdog_timeout_cfg?' ⚠️被驱动调整':''}</div></div></div>
     ${s.nowayout ? '<div class="stat"><div class="k" style="color:var(--bad)">nowayout</div><div class="val" style="font-size:13px;color:var(--bad)">已锁定<div class="muted" style="font-size:11px">不可 magic close，停止服务也会硬复位</div></div></div>' : ''}
     <div class="stat"><div class="k">内存</div><div class="val">${memTxt}<div class="muted" style="font-size:11px">${availTxt} / ${s.total_memory_mb}MB 总量</div></div></div>
     <div class="stat"><div class="k">负载(1m)</div><div class="val">${s.current_load}</div></div>
@@ -174,15 +206,17 @@ async function refresh(){
     ${s.in_boot_grace ? `<div class="stat"><div class="k">开机冷却期</div><div class="val" style="font-size:13px;color:var(--warn)">冷却中（不判定）</div></div>` : ''}`;
 
   // 硬件信息卡
-  $('hwInfo').style.display = '';
-  $('hwInfoBody').innerHTML = `
-    <div class="hw-grid">
-      <div class="hw-item"><span class="hw-k">内核版本</span><span class="hw-v">${esc(s.kernel_version)}</span></div>
-      <div class="hw-item"><span class="hw-k">CPU 型号</span><span class="hw-v">${esc(s.cpu_model)}</span></div>
-      <div class="hw-item"><span class="hw-k">物理内存</span><span class="hw-v">${s.total_memory_mb} MB</span></div>
-    </div>`;
+  if (s.kernel_version || s.cpu_model || s.total_memory_mb) {
+    $('hwInfo').style.display = '';
+    $('hwInfoBody').innerHTML = `
+      <div class="hw-grid">
+        <div class="hw-item"><span class="hw-k">内核版本</span><span class="hw-v">${esc(s.kernel_version)}</span></div>
+        <div class="hw-item"><span class="hw-k">CPU 型号</span><span class="hw-v">${esc(s.cpu_model)}</span></div>
+        <div class="hw-item"><span class="hw-k">物理内存</span><span class="hw-v">${s.total_memory_mb} MB</span></div>
+      </div>`;
+  }
 
-  // 开机来源标注（boot_reason 是自由文本，含来源标题）
+  // 开机来源标注
   if (s.boot_reason) {
     $('bootSource').style.display = '';
     const title = s.boot_reason;
@@ -231,12 +265,19 @@ async function refresh(){
   $('enabledTxt').textContent = mode;
   if (s.last_reboot_reason) $('stats').insertAdjacentHTML('beforeend',
     `<div class="stat"><div class="k">上次重启原因</div><div class="val" style="font-size:13px">${esc(s.last_reboot_reason.split('\n')[1]||s.last_reboot_reason)}</div></div>`);
+}
 
-  const c = await (await fetch('/api/config')).json();
-  for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','boot_grace_min','port','load_threshold','dstate_threshold','mem_available_threshold','trend_interval'])
-    $(k).value = c[k];
-  for (const k of ['auto_reboot','check_fork','check_load','check_dstate','check_service_probe','check_memory'])
-    $(k).checked = c[k];
+function renderConfig(c){
+  // v1.4.0：安全赋值，防止 undefined 导致输入框为空
+  const numFields = ['interval_sec','watchdog_timeout_sec','fail_threshold','boot_grace_min','port','load_threshold','dstate_threshold','mem_available_threshold','trend_interval'];
+  for (const k of numFields) {
+    const v = c[k];
+    $(k).value = (v !== undefined && v !== null) ? v : '';
+  }
+  const boolFields = ['auto_reboot','check_fork','check_load','check_dstate','check_service_probe','check_memory'];
+  for (const k of boolFields) {
+    $(k).checked = !!c[k];
+  }
   $('service_probe_cmd').value = c.service_probe_cmd || '';
 }
 function esc(s){ return (s||'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
@@ -254,41 +295,98 @@ function updateCountdown(unixSec){
 }
 
 async function startMaint(){
-  const r = await fetch('/api/maintain?minutes=30',{method:'POST'});
-  if (r.ok) { toast('已进入维护模式（30分钟）'); refresh(); }
-  else toast('操作失败');
+  try {
+    const r = await fetch('/api/maintain?minutes=30',{method:'POST'});
+    if (r.ok) { toast('已进入维护模式（30分钟）'); refresh(); }
+    else toast('操作失败: ' + r.statusText);
+  } catch(e) {
+    toast('维护模式请求失败: ' + e.message);
+  }
 }
 async function cancelMaint(){
-  const r = await fetch('/api/maintain?minutes=0',{method:'POST'});
-  if (r.ok) { toast('已取消维护模式'); refresh(); }
-  else toast('操作失败');
+  try {
+    const r = await fetch('/api/maintain?minutes=0',{method:'POST'});
+    if (r.ok) { toast('已取消维护模式'); refresh(); }
+    else toast('取消失败: ' + r.statusText);
+  } catch(e) {
+    toast('取消维护模式请求失败: ' + e.message);
+  }
 }
 
 async function saveConfig(){
-  const c = {};
-  for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','boot_grace_min','port','load_threshold','dstate_threshold','mem_available_threshold','trend_interval'])
-    c[k] = Number($(k).value);
-  for (const k of ['auto_reboot','check_fork','check_load','check_dstate','check_service_probe','check_memory'])
-    c[k] = $(k).checked;
-  c.service_probe_cmd = $('service_probe_cmd').value;
-  c.enabled = $('enabledSw').checked;
-  const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
-  toast(r.ok ? '配置已保存' : '保存失败');
-  refresh();
+  try {
+    const c = {};
+    for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','boot_grace_min','port','load_threshold','dstate_threshold','mem_available_threshold','trend_interval'])
+      c[k] = Number($(k).value);
+    for (const k of ['auto_reboot','check_fork','check_load','check_dstate','check_service_probe','check_memory'])
+      c[k] = $(k).checked;
+    c.service_probe_cmd = $('service_probe_cmd').value;
+    c.enabled = $('enabledSw').checked;
+    const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
+    if (r.ok) { toast('配置已保存'); refresh(); }
+    else toast('保存失败: ' + r.statusText);
+  } catch(e) {
+    toast('保存配置失败: ' + e.message);
+  }
 }
 async function loadLogs(){
-  const r = await fetch('/api/logs?lines=300');
-  $('logs').textContent = await r.text();
+  try {
+    const r = await fetch('/api/logs?lines=300');
+    const text = await r.text();
+    $('logs').textContent = text || '(暂无日志)';
+  } catch(e) {
+    $('logs').textContent = '日志加载失败: ' + e.message;
+  }
 }
 $('enabledSw').addEventListener('change', async e=>{
-  const r = await fetch('/api/toggle?enabled='+(e.target.checked?1:0),{method:'POST'});
-  toast(r.ok ? (e.target.checked?'监控已开启':'监控已暂停') : '操作失败');
-  refresh();
+  try {
+    const r = await fetch('/api/toggle?enabled='+(e.target.checked?1:0),{method:'POST'});
+    toast(r.ok ? (e.target.checked?'监控已开启':'监控已暂停') : '操作失败: ' + r.statusText);
+    refresh();
+  } catch(e) {
+    toast('开关操作失败: ' + e.message);
+  }
 });
 async function svc(a){
-  const r = await fetch('/api/service?action='+a,{method:'POST'});
-  const j = await r.json();
-  toast((j.error? '错误: '+j.error : a+' 完成') + (j.output? ' ('+j.output+')':''));
+  try {
+    const r = await fetch('/api/service?action='+a,{method:'POST'});
+    const j = await r.json();
+    const msg = (j.error ? '错误: '+j.error : a+' 完成') + (j.output ? ' ('+j.output+')':'') + (j.warn ? '\n⚠️ '+j.warn : '');
+    toast(msg || (a+' 请求已发送'));
+    // 显示详细结果到服务控制区域
+    const sr = $('svcResult');
+    if (j.error || j.warn) {
+      sr.className = j.error ? 'errbox' : 'infobox';
+      sr.innerHTML = '<b>'+a+'</b>: ' + (msg.replace(/\n/g,'<br>'));
+      sr.style.display = '';
+    } else {
+      sr.style.display = 'none';
+    }
+  } catch(e) {
+    toast(a+' 操作失败: ' + e.message);
+    const sr = $('svcResult');
+    sr.className = 'errbox';
+    sr.innerHTML = '<b>'+a+'</b> 请求异常: ' + e.message + '<br>服务可能未通过 systemd 管理，请使用飞牛应用中心控制。';
+    sr.style.display = '';
+  }
+}
+// v1.4.0：健康检查诊断
+async function checkHealth(){
+  try {
+    const h = await (await fetch('/api/health')).json();
+    alert('KanmenDog 诊断信息:\n\n版本: ' + h.version +
+      '\nPID: ' + h.pid +
+      '\n运行时间: ' + h.uptime_sec + '秒' +
+      '\n配置文件: ' + h.config_path + ' (' + (h.config_exists?'存在':'不存在') + ')' +
+      '\n日志文件: ' + h.log_path + ' (' + (h.log_exists?'存在':'不存在') + ')' +
+      '\n看门狗: ' + (h.watchdog_open?'已打开':'未打开') + ' ' + h.watchdog_device +
+      '\nsystemctl: ' + h.systemctl +
+      '\nTRIM_PKGETC=' + (h.env_trim_pkgetc||'(未设置)') +
+      '\nTRIM_PKGVAR=' + (h.env_trim_pkgvar||'(未设置)') +
+      '\nTRIM_APPDEST=' + (h.env_trim_appdest||'(未设置)'));
+  } catch(e) {
+    alert('无法连接到 KanmenDog 服务: ' + e.message + '\n\n请确认：\n1. 服务正在运行\n2. 端口未被占用\n3. 防火墙未阻止访问');
+  }
 }
 refresh(); loadLogs();
 setInterval(()=>{ refresh(); }, 15000);
