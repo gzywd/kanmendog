@@ -1,7 +1,5 @@
 {
   "defaults": {
     "run-as": "root"
-  },
-  "username": "root",
-  "groupname": "root"
+  }
 }
