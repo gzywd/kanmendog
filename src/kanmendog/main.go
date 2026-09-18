@@ -36,7 +36,7 @@ var uiFS embed.FS
 
 const (
 	appName        = "com.gzywd.kanmendog"
-	appVersion     = "1.0.0"
+	appVersion     = "1.1.0"
 	defaultPort    = 8900
 	watchdogDevice = "/dev/watchdog"
 	logMaxBytes    = 5 * 1024 * 1024 // 日志滚动阈值
@@ -55,8 +55,11 @@ type Config struct {
 	LoadThreshold      float64 `json:"load_threshold"`       // 1 分钟负载均值阈值
 	CheckDState        bool    `json:"check_dstate"`         // 不可中断(D)进程数测试
 	DStateThreshold    int     `json:"dstate_threshold"`     // D 状态进程数阈值
-	CheckServiceProbe  bool    `json:"check_service_probe"`  // 外部命令探针
+	CheckMemory        bool    `json:"check_memory"`         // 内存可用率测试（针对 OOM 死机）
+	MemAvailableThreshold int  `json:"mem_available_threshold"` // 可用内存低于该百分比(%)判定异常
+	CheckServiceProbe  bool    `json:"check_service_probe"`  // 外部命令探针（默认探测飞牛本地 Web）
 	ServiceProbeCmd    string  `json:"service_probe_cmd"`    // 必须返回 0 的命令
+	TrendInterval      int     `json:"trend_interval"`       // 趋势日志间隔（周期数，0=关闭）
 }
 
 func defaultConfig() Config {
@@ -72,8 +75,11 @@ func defaultConfig() Config {
 		LoadThreshold:      16,
 		CheckDState:        true,
 		DStateThreshold:    20,
-		CheckServiceProbe:  false,
-		ServiceProbeCmd:    "",
+		CheckMemory:        true,
+		MemAvailableThreshold: 5,
+		CheckServiceProbe:  true,
+		ServiceProbeCmd:    "curl -sS -o /dev/null -m 5 http://127.0.0.1/",
+		TrendInterval:      5,
 	}
 }
 
@@ -96,6 +102,9 @@ func (c *Config) logPath() string {
 }
 func (c *Config) reasonPath() string {
 	return filepath.Join(c.varDir(), "last_reboot_reason")
+}
+func (c *Config) trendPath() string {
+	return filepath.Join(c.varDir(), "trend.csv")
 }
 
 // ---- 日志 ----
@@ -356,6 +365,158 @@ func runServiceProbe(ctx context.Context, cmdStr string) checkResult {
 	return r
 }
 
+// runMemory 检查内存可用率；可用率低于阈值(%)判定异常，直接命中 OOM 类死机。
+// 若内核未提供 MemAvailable（老内核）则跳过判定，不误杀。
+func runMemory(ctx context.Context, thresholdPct int) checkResult {
+	r := checkResult{Name: "内存可用率", OK: true}
+	type mem struct {
+		availPct float64
+		availMB  float64
+		totalMB  float64
+		has      bool
+	}
+	done := make(chan mem, 1)
+	go func() {
+		b, err := os.ReadFile("/proc/meminfo")
+		if err != nil {
+			done <- mem{}
+			return
+		}
+		var total, avail int64
+		has := false
+		for _, l := range strings.Split(string(b), "\n") {
+			f := strings.Fields(l)
+			if len(f) < 2 {
+				continue
+			}
+			switch f[0] {
+			case "MemTotal:":
+				total, _ = strconv.ParseInt(f[1], 10, 64)
+			case "MemAvailable:":
+				avail, _ = strconv.ParseInt(f[1], 10, 64)
+				has = true
+			}
+		}
+		if !has || total <= 0 {
+			done <- mem{}
+			return
+		}
+		ap := float64(avail) / float64(total) * 100
+		done <- mem{availPct: ap, availMB: float64(avail) / 1024, totalMB: float64(total) / 1024, has: true}
+	}()
+	select {
+	case m := <-done:
+		if !m.has {
+			r.Detail = "内核未提供 MemAvailable，跳过内存检查"
+			return r
+		}
+		if m.availPct < float64(thresholdPct) {
+			r.OK = false
+			r.Detail = fmt.Sprintf("内存即将耗尽：可用 %.1f%% < %d%%（可用 %.0f/%.0f MB，已用 %.1f%%）",
+				m.availPct, thresholdPct, m.availMB, m.totalMB, 100-m.availPct)
+		} else {
+			r.Detail = fmt.Sprintf("可用 %.1f%%（%.0f/%.0f MB）", m.availPct, m.availMB, m.totalMB)
+		}
+	case <-ctx.Done():
+		r.OK, r.Detail = false, "读取 /proc/meminfo 超时"
+	}
+	return r
+}
+
+// readOOMLog 抓取内核 dmesg 中最近的 OOM / 进程被 kill 记录，用于复盘死机根因。
+// 重启后 dmesg 会被清空，因此需在死亡当刻（本进程仍存活）捕获。
+func readOOMLog() string {
+	out, err := exec.Command("/bin/sh", "-c",
+		"dmesg 2>/dev/null | grep -iE 'out of memory|killed process|oom-kill|oom_reaper|memory cgroup out of memory' | tail -20").Output()
+	if err != nil {
+		return ""
+	}
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = "  " + lines[i]
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// readWatchdogIdentity 读取看门狗驱动身份（如 iTCO_wdt=硬件，softdog=软件），
+// 用于状态页明确当前是硬件还是软件复位能力。
+func readWatchdogIdentity() string {
+	matches, _ := filepath.Glob("/sys/class/watchdog/*/identity")
+	for _, m := range matches {
+		if b, err := os.ReadFile(m); err == nil {
+			return strings.TrimSpace(string(b))
+		}
+	}
+	if _, err := os.Stat(watchdogDevice); err == nil {
+		return "unknown(dev-exists)"
+	}
+	return "none"
+}
+
+// memUsage 返回 (已用百分比, 可用MB)，供状态页展示。
+func memUsage() (usedPct int, availMB int) {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return -1, -1
+	}
+	var total, avail int64
+	for _, l := range strings.Split(string(b), "\n") {
+		f := strings.Fields(l)
+		if len(f) < 2 {
+			continue
+		}
+		switch f[0] {
+		case "MemTotal:":
+			total, _ = strconv.ParseInt(f[1], 10, 64)
+		case "MemAvailable:":
+			avail, _ = strconv.ParseInt(f[1], 10, 64)
+		}
+	}
+	if total <= 0 {
+		return -1, -1
+	}
+	return int(100 - float64(avail)/float64(total)*100), int(float64(avail) / 1024)
+}
+
+// writeTrend 周期性记录系统趋势到 trend.csv，便于复盘"内存爬升→OOM"。
+func (d *daemon) writeTrend() {
+	usedPct, availMB := memUsage()
+	load := d.currentLoad()
+	dstate := d.dstateCount()
+	procs := 0
+	if ds, err := os.ReadDir("/proc"); err == nil {
+		for _, p := range ds {
+			if p.IsDir() {
+				if _, e := strconv.Atoi(p.Name()); e == nil {
+					procs++
+				}
+			}
+		}
+	}
+	oom := ""
+	if readOOMLog() != "" {
+		oom = "OOM"
+	}
+	line := fmt.Sprintf("%s,%d,%d,%s,%d,%d,%s\n",
+		time.Now().Format(time.RFC3339), usedPct, availMB, load, dstate, procs, oom)
+	path := d.cfg.trendPath()
+	_, statErr := os.Stat(path)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if statErr != nil {
+		// 首行写表头
+		_, _ = f.WriteString("time,memory_used_pct,mem_available_mb,load1,dstate_count,proc_count,oom_flag\n")
+	}
+	_, _ = f.WriteString(line)
+}
+
 // ---- 状态 ----
 
 type status struct {
@@ -363,11 +524,15 @@ type status struct {
 	Enabled          bool     `json:"enabled"`
 	WatchdogOpen     bool     `json:"watchdog_open"`
 	WatchdogDevice   string   `json:"watchdog_device"`
+	WatchdogIdentity string   `json:"watchdog_identity"` // 硬件(iTCO_wdt) / 软件(softdog)
 	WatchdogTimeout  int      `json:"watchdog_timeout"`
 	Version          string   `json:"version"`
 	Uptime           string   `json:"uptime"`
 	CurrentLoad      string   `json:"current_load"`
 	DStateCount      int      `json:"dstate_count"`
+	MemoryUsedPct    int      `json:"memory_used_pct"`
+	MemAvailableMB   int      `json:"mem_available_mb"`
+	TrendEnabled     bool     `json:"trend_enabled"`
 	LastRebootReason string   `json:"last_reboot_reason"`
 	ConsecutiveFails int      `json:"consecutive_fails"`
 	Pid              int      `json:"pid"`
@@ -383,6 +548,7 @@ type daemon struct {
 	failCount     int
 	lastReason    string
 	startTime     time.Time
+	cycle         int // 健康检查周期计数，用于趋势日志
 }
 
 func loadOrInitConfig(cfg *Config) {
@@ -409,22 +575,40 @@ func saveConfig(cfg *Config) error {
 	return os.WriteFile(cfg.configPath(), b, 0o644)
 }
 
-// systemSnapshot 收集重启前的系统快照，便于排查
+// systemSnapshot 收集重启前的系统快照，便于排查死机根因
 func systemSnapshot() string {
 	var sb strings.Builder
+	sb.WriteString("time: " + time.Now().Format(time.RFC3339) + "\n")
 	if b, err := os.ReadFile("/proc/loadavg"); err == nil {
 		sb.WriteString("loadavg: " + strings.TrimSpace(string(b)) + "\n")
 	}
 	if b, err := os.ReadFile("/proc/meminfo"); err == nil {
-		lines := strings.Split(string(b), "\n")
-		for _, l := range lines {
-			if strings.HasPrefix(l, "MemTotal:") || strings.HasPrefix(l, "MemAvailable:") {
+		for _, l := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(l, "MemTotal:") || strings.HasPrefix(l, "MemAvailable:") ||
+				strings.HasPrefix(l, "MemFree:") || strings.HasPrefix(l, "Buffers:") ||
+				strings.HasPrefix(l, "Cached:") || strings.HasPrefix(l, "SwapTotal:") ||
+				strings.HasPrefix(l, "SwapFree:") {
 				sb.WriteString(l + "\n")
 			}
 		}
 	}
 	d := runDState(context.Background(), 999999)
 	sb.WriteString("dstate: " + d.Detail + "\n")
+	// 内存占用最高的进程（定位是谁在吃内存，例如 Nginx 崩溃循环刷日志）
+	if out, err := exec.Command("ps", "aux", "--sort=-%mem").Output(); err == nil {
+		lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+		sb.WriteString("top_mem_procs:\n")
+		for i, l := range lines {
+			if i >= 8 {
+				break
+			}
+			sb.WriteString("  " + l + "\n")
+		}
+	}
+	// 内核 OOM / 进程被 kill 证据
+	if oom := readOOMLog(); oom != "" {
+		sb.WriteString("oom_kernel_log:\n" + oom)
+	}
 	sb.WriteString("uptime: " + readUptime() + "\n")
 	return sb.String()
 }
@@ -446,11 +630,16 @@ func (d *daemon) ensureWatchdog() {
 				gLog.Write([]byte(fmt.Sprintf("[%s] 看门狗打开失败（将无法硬复位）: %v\n",
 					time.Now().Format(time.RFC3339), err)))
 				d.wd = nil
-			} else {
-				d.wd = w
-				gLog.Write([]byte(fmt.Sprintf("[%s] 看门狗已开启: %s (超时约%d秒)\n",
-					time.Now().Format(time.RFC3339), watchdogDevice, d.cfg.WatchdogTimeoutSec)))
+		} else {
+			d.wd = w
+			id := readWatchdogIdentity()
+			kind := "软件看门狗(softdog)"
+			if !strings.Contains(id, "softdog") && id != "none" && id != "" {
+				kind = "硬件看门狗"
 			}
+			gLog.Write([]byte(fmt.Sprintf("[%s] 看门狗已开启: %s identity=%s (%s, 超时约%d秒)\n",
+				time.Now().Format(time.RFC3339), watchdogDevice, id, kind, d.cfg.WatchdogTimeoutSec)))
+		}
 		}
 		d.monitoring = d.wd != nil
 	} else {
@@ -466,6 +655,9 @@ func (d *daemon) ensureWatchdog() {
 func (d *daemon) triggerReboot(reason string) {
 	ts := time.Now().Format(time.RFC3339)
 	snapshot := systemSnapshot()
+	if readOOMLog() != "" {
+		gLog.Write([]byte(fmt.Sprintf("[%s] 快照含内核OOM证据（详见 oom_kernel_log）\n", ts)))
+	}
 	msg := fmt.Sprintf("[%s] !!! 判定系统死机，准备重启 !!!\n原因: %s\n快照:\n%s",
 		ts, reason, snapshot)
 	gLog.Write([]byte(msg + "\n"))
@@ -496,6 +688,12 @@ func (d *daemon) loop() {
 		cfg := d.cfg
 		d.mu.Unlock()
 
+		d.cycle++
+		// 周期性记录趋势，便于复盘"内存爬升→OOM"
+		if cfg.TrendInterval > 0 && d.cycle%cfg.TrendInterval == 0 {
+			d.writeTrend()
+		}
+
 		if !cfg.Enabled {
 			time.Sleep(2 * time.Second)
 			continue
@@ -513,6 +711,9 @@ func (d *daemon) loop() {
 		}
 		if cfg.CheckDState {
 			results = append(results, runDState(cycleCtx, cfg.DStateThreshold))
+		}
+		if cfg.CheckMemory {
+			results = append(results, runMemory(cycleCtx, cfg.MemAvailableThreshold))
 		}
 		if cfg.CheckServiceProbe {
 			results = append(results, runServiceProbe(cycleCtx, cfg.ServiceProbeCmd))
@@ -580,16 +781,22 @@ func (d *daemon) buildStatus() status {
 	if b, err := os.ReadFile(d.cfg.reasonPath()); err == nil {
 		reason = strings.TrimSpace(string(b))
 	}
+	id := readWatchdogIdentity()
+	usedPct, availMB := memUsage()
 	return status{
 		Running:          true,
 		Enabled:          enabled,
 		WatchdogOpen:     wd != nil,
 		WatchdogDevice:   watchdogDevice,
+		WatchdogIdentity: id,
 		WatchdogTimeout:  d.cfg.WatchdogTimeoutSec,
 		Version:          appVersion,
 		Uptime:           readUptime(),
 		CurrentLoad:      d.currentLoad(),
 		DStateCount:      d.dstateCount(),
+		MemoryUsedPct:    usedPct,
+		MemAvailableMB:   availMB,
+		TrendEnabled:     d.cfg.TrendInterval > 0,
 		LastRebootReason: reason,
 		ConsecutiveFails: fails,
 		Pid:              os.Getpid(),

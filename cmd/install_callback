@@ -16,16 +16,32 @@ if [ ! -x "$APPDEST/kanmendog" ]; then
 fi
 
 # 2) 探测并加载看门狗模块（硬件优先，软看门狗兜底）
+detect_watchdog_id() {
+  for f in /sys/class/watchdog/*/identity; do
+    [ -r "$f" ] && cat "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
 if [ ! -e /dev/watchdog ]; then
   if modprobe iTCO_wdt 2>/dev/null; then
-    log "已加载硬件看门狗模块 iTCO_wdt"
+    log "已加载硬件看门狗模块 iTCO_wdt（Intel 主板自带，如惠普 EliteDesk 800 系列）"
   elif modprobe softdog 2>/dev/null; then
-    log "已加载软件看门狗模块 softdog（无硬件看门狗时的退路）"
+    log "已加载软件看门狗模块 softdog（无硬件看门狗时的退路；注意：内核冻结时 softdog 不递减，无法复位）"
   else
-    log "警告：未能加载任何看门狗模块，/dev/watchdog 不存在，硬复位将不可用（依赖内核 lockup→panic 兜底）"
+    log "警告：未能加载任何看门狗模块，/dev/watchdog 不存在，硬复位将不可用（仅能靠内核 lockup→panic 兜底）"
   fi
 else
   log "检测到看门狗设备 /dev/watchdog"
+fi
+if [ -e /dev/watchdog ]; then
+  WID=$(detect_watchdog_id 2>/dev/null || echo unknown)
+  if echo "$WID" | grep -qi softdog; then
+    log "看门狗身份: $WID —— 软件看门狗(softdog)：仅覆盖软死机/单核 lockup，全核冻结无法自动复位"
+  else
+    log "看门狗身份: $WID —— 硬件看门狗：具备硬复位能力（独立于内核）"
+  fi
+else
+  log "无可用看门狗设备：本机不具备硬复位能力。建议加带外物理断电方案（智能插座/ESP32）以覆盖全核冻结"
 fi
 
 # 3) 内核 lockup 检测 → panic → 自动重启（覆盖单核卡死，用户态健康检查测不到它）

@@ -78,7 +78,10 @@
     <label><span>1 分钟负载阈值</span><input type="number" id="load_threshold" step="0.1" min="0"></label>
     <label><span>D状态进程数测试</span><input type="checkbox" id="check_dstate"></label>
     <label><span>D状态进程数阈值</span><input type="number" id="dstate_threshold" min="0" max="500"></label>
-    <label><span>外部命令探针</span><input type="checkbox" id="check_service_probe"></label>
+    <label><span>内存可用率检查（防 OOM 死机）</span><input type="checkbox" id="check_memory"></label>
+    <label><span>可用内存低于该百分比(%)判定异常</span><input type="number" id="mem_available_threshold" min="1" max="100"></label>
+    <label><span>趋势日志间隔（周期数，0=关闭）</span><input type="number" id="trend_interval" min="0" max="200"></label>
+    <label><span>外部命令探针（默认探测飞牛本地 Web）</span><input type="checkbox" id="check_service_probe"></label>
     <label><span>探针命令（返回0即通过）</span><input type="text" id="service_probe_cmd" style="width:280px"></label>
     <div class="btns"><button onclick="saveConfig()">保存配置</button><span class="muted">保存即时生效；部分项需重启服务</span></div>
   </div>
@@ -113,21 +116,28 @@ async function refresh(){
   $('ver').textContent = 'v'+s.version;
   const pill = on => `<span class="pill ${on?'on':'off'}">${on?'运行中':'已停止'}</span>`;
   const wd = s.watchdog_open ? '<span class="pill on">已开启</span>' : '<span class="pill off">未开启</span>';
+  const wdId = s.watchdog_identity || 'unknown';
+  const wdKind = wdId==='none' ? '无设备' : (String(wdId).toLowerCase().includes('softdog') ? '软件软狗' : '硬件看门狗');
+  const memTxt = s.memory_used_pct<0 ? '?' : s.memory_used_pct+'%';
+  const availTxt = s.mem_available_mb<0 ? '?' : s.mem_available_mb+' MB';
   $('stats').innerHTML = `
     <div class="stat"><div class="k">监控状态</div><div class="val">${pill(s.enabled)}</div></div>
     <div class="stat"><div class="k">看门狗 ${s.watchdog_device}</div><div class="val">${wd}</div></div>
+    <div class="stat"><div class="k">看门狗类型</div><div class="val" style="font-size:15px">${wdKind}<div class="muted" style="font-size:11px">${wdId}</div></div></div>
+    <div class="stat"><div class="k">内存已用</div><div class="val">${memTxt}</div></div>
+    <div class="stat"><div class="k">可用内存</div><div class="val">${availTxt}</div></div>
     <div class="stat"><div class="k">当前负载(1m)</div><div class="val">${s.current_load}</div></div>
     <div class="stat"><div class="k">D状态进程</div><div class="val">${s.dstate_count}</div></div>
-    <div class="stat"><div class="k">连续失败</div><div class="val">${s.consecutive_fails}/${'/'}</div></div>
+    <div class="stat"><div class="k">连续失败</div><div class="val">${s.consecutive_fails}</div></div>
     <div class="stat"><div class="k">进程 PID</div><div class="val">${s.pid}</div></div>`;
   $('enabledSw').checked = s.enabled;
   $('enabledTxt').textContent = s.enabled ? '监控进行中，检测到死机将自动重启' : '监控已暂停';
   if (s.last_reboot_reason) $('stats').insertAdjacentHTML('beforeend',
     `<div class="stat"><div class="k">上次重启原因</div><div class="val" style="font-size:13px">${esc(s.last_reboot_reason.split('\n')[1]||s.last_reboot_reason)}</div></div>`);
   const c = await (await fetch('/api/config')).json();
-  for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','port','load_threshold','dstate_threshold'])
+  for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','port','load_threshold','dstate_threshold','mem_available_threshold','trend_interval'])
     $(k).value = c[k];
-  for (const k of ['auto_reboot','check_fork','check_load','check_dstate','check_service_probe'])
+  for (const k of ['auto_reboot','check_fork','check_load','check_dstate','check_service_probe','check_memory'])
     $(k).checked = c[k];
   $('service_probe_cmd').value = c.service_probe_cmd || '';
 }
@@ -135,9 +145,9 @@ function esc(s){ return (s||'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>'
 
 async function saveConfig(){
   const c = {};
-  for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','port','load_threshold','dstate_threshold'])
+  for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','port','load_threshold','dstate_threshold','mem_available_threshold','trend_interval'])
     c[k] = Number($(k).value);
-  for (const k of ['auto_reboot','check_fork','check_load','check_dstate','check_service_probe'])
+  for (const k of ['auto_reboot','check_fork','check_load','check_dstate','check_service_probe','check_memory'])
     c[k] = $(k).checked;
   c.service_probe_cmd = $('service_probe_cmd').value;
   c.enabled = $('enabledSw').checked;
