@@ -1,7 +1,7 @@
 appname=com.gzywd.kanmendog
-version=1.3.0
-display_name=看门狗 KanmenDog (v1.3.0)
-desc=零误杀 NAS 看门狗：死机自动重启，正常使用/升级/重启绝不误判。v1.3.0 新增开机重启来源标注、手动维护模式、探针学习期、端口迁移检测、安装向导探针知情选择。
+version=1.3.1
+display_name=看门狗 KanmenDog (v1.3.1)
+desc=零误杀 NAS 看门狗：死机自动重启，正常使用/升级/重启绝不误判。v1.3.1 修复致命重启失效bug+硬件信息增强+配置校验。
 source=thirdparty
 platform=x86
 maintainer=gzywd
@@ -11,4 +11,4 @@ desktop_uidir=ui
 desktop_applaunchname=com.gzywd.kanmendog.main
 ctl_stop=true
 checkport=false
-changelog=v1.3.0 产品闭环：开机重启来源标注（wtmp/journalctl分类）、手动维护模式（API+页面按钮+倒计时）、探针首探学习期、端口迁移检测、安装向导探针知情选择、triggerReboot两段式落盘、维护窗口退出清零失败计数、trend日志滚动。
+changelog=v1.3.1 致命修复：triggerReboot返回后不再恢复喂狗（彻底关闭fd+阻塞不返回）；probeCandidatePorts加总超时；状态API新增硬件信息（内核/CPU/内存/nowayout）；启动日志记录完整硬件环境；配置值合法性校验；fpk文件名带版本号。

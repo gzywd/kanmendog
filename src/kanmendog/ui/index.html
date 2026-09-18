@@ -50,6 +50,10 @@
   .source-card .src-title { font-size:12px; color:var(--muted); margin-bottom:4px; }
   .source-card .src-val { font-size:16px; font-weight:600; }
   .source-card .src-detail { font-size:12px; color:var(--muted); margin-top:4px; }
+  .hw-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:8px; }
+  .hw-item { display:flex; flex-direction:column; gap:2px; }
+  .hw-k { font-size:11px; color:var(--muted); }
+  .hw-v { font-size:13px; color:var(--fg); word-break:break-all; }
   .maint-bar { display:flex; align-items:center; gap:12px; padding:10px 14px; background:rgba(245,158,11,.06); border:1px solid rgba(245,158,11,.3); border-radius:8px; margin:8px 0; }
   .maint-bar .countdown { font-size:18px; font-weight:700; color:var(--warn); min-width:60px; text-align:center; }
 </style>
@@ -65,6 +69,12 @@
     <div class="src-title">📋 本次重启来源</div>
     <div class="src-val" id="bootSourceVal"></div>
     <div class="src-detail" id="bootSourceDetail"></div>
+  </div>
+
+  <!-- 硬件信息卡 -->
+  <div class="source-card" id="hwInfo" style="display:none">
+    <div class="src-title">🖥️ 硬件环境</div>
+    <div id="hwInfoBody"></div>
   </div>
 
   <div class="grid" id="stats"></div>
@@ -152,32 +162,39 @@ async function refresh(){
   const availTxt = s.mem_available_mb<0 ? '?' : s.mem_available_mb+' MB';
   $('stats').innerHTML = `
     <div class="stat"><div class="k">监控状态</div><div class="val">${pill(s.enabled)}</div></div>
-    <div class="stat"><div class="k">看门狗 ${s.watchdog_device}</div><div class="val">${wd}</div></div>
-    <div class="stat"><div class="k">看门狗类型</div><div class="val" style="font-size:15px">${wdKind}<div class="muted" style="font-size:11px">${wdId}</div></div></div>
-    <div class="stat"><div class="k">内存已用</div><div class="val">${memTxt}</div></div>
-    <div class="stat"><div class="k">可用内存</div><div class="val">${availTxt}</div></div>
-    <div class="stat"><div class="k">当前负载(1m)</div><div class="val">${s.current_load}</div></div>
+    <div class="stat"><div class="k">看门狗</div><div class="val">${wd}<div class="muted" style="font-size:11px">${wdKind} | ${wdId}</div></div></div>
+    <div class="stat"><div class="k">看门狗超时</div><div class="val">${s.watchdog_timeout}s<div class="muted" style="font-size:11px">配置 ${s.watchdog_timeout_cfg}s${s.watchdog_timeout!==s.watchdog_timeout_cfg?' ⚠️被驱动调整':'')}</div></div></div>
+    ${s.nowayout ? '<div class="stat"><div class="k" style="color:var(--bad)">nowayout</div><div class="val" style="font-size:13px;color:var(--bad)">已锁定<div class="muted" style="font-size:11px">不可 magic close，停止服务也会硬复位</div></div></div>' : ''}
+    <div class="stat"><div class="k">内存</div><div class="val">${memTxt}<div class="muted" style="font-size:11px">${availTxt} / ${s.total_memory_mb}MB 总量</div></div></div>
+    <div class="stat"><div class="k">负载(1m)</div><div class="val">${s.current_load}</div></div>
     <div class="stat"><div class="k">D状态进程</div><div class="val">${s.dstate_count}</div></div>
     <div class="stat"><div class="k">连续失败</div><div class="val">${s.consecutive_fails}</div></div>
-    <div class="stat"><div class="k">进程 PID</div><div class="val">${s.pid}</div></div>
+    <div class="stat"><div class="k">PID / 运行时间</div><div class="val" style="font-size:14px">${s.pid}<div class="muted" style="font-size:11px">${s.uptime}</div></div></div>
     ${s.upgrade_busy ? `<div class="stat"><div class="k">维护窗口</div><div class="val" style="font-size:13px;color:var(--warn)">${esc(s.upgrade_busy)}</div></div>` : ''}
     ${s.in_boot_grace ? `<div class="stat"><div class="k">开机冷却期</div><div class="val" style="font-size:13px;color:var(--warn)">冷却中（不判定）</div></div>` : ''}`;
 
-  // 开机来源标注
-  if (s.boot_source) {
+  // 硬件信息卡
+  $('hwInfo').style.display = '';
+  $('hwInfoBody').innerHTML = `
+    <div class="hw-grid">
+      <div class="hw-item"><span class="hw-k">内核版本</span><span class="hw-v">${esc(s.kernel_version)}</span></div>
+      <div class="hw-item"><span class="hw-k">CPU 型号</span><span class="hw-v">${esc(s.cpu_model)}</span></div>
+      <div class="hw-item"><span class="hw-k">物理内存</span><span class="hw-v">${s.total_memory_mb} MB</span></div>
+    </div>`;
+
+  // 开机来源标注（boot_reason 是自由文本，含来源标题）
+  if (s.boot_reason) {
     $('bootSource').style.display = '';
-    const srcMap = {
-      'watchdog': ['⚠️ 看门狗判定死机', '系统因连续异常被看门狗自动重启，详情见日志。', 'color:var(--bad)'],
-      'hardware_reset': ['🔌 硬件看门狗复位', '全核冻结导致硬件看门狗超时复位（进程无法写日志），属最后兜底机制。', 'color:var(--bad)'],
-      'kernel_panic': ['💥 内核 panic', '内核检测到硬锁死(hard lockup)触发 panic→reboot。', 'color:var(--bad)'],
-      'normal_shutdown': ['✅ 正常关机/重启', '上次为用户主动关机或 reboot 命令重启，无异常。', 'color:var(--ok)'],
-      'unknown': ['❓ 来源不明', '无法确定上次重启原因，可能为首次安装或日志已被清理。', 'color:var(--warn)'],
-    };
-    const info = srcMap[s.boot_source] || srcMap['unknown'];
-    $('bootSourceVal').textContent = info[0];
-    $('bootSourceVal').style.color = info[2];
-    $('bootSourceDetail').textContent = info[1];
-    if (s.boot_source_detail) $('bootSourceDetail').textContent += ' '+s.boot_source_detail;
+    const title = s.boot_reason;
+    let desc = '', color = 'var(--warn)';
+    if (title.includes('本程序判定')) { desc = '系统因连续异常被看门狗自动重启。'; color = 'var(--bad)'; }
+    else if (title.includes('异常重启') || title.includes('硬件')) { desc = '无干净关机记录，疑似硬件复位/断电/全核冻结。'; color = 'var(--bad)'; }
+    else if (title.includes('panic')) { desc = '内核 hard lockup 触发 panic→reboot。'; color = 'var(--bad)'; }
+    else if (title.includes('正常关机')) { desc = '用户主动关机或 reboot，无异常。'; color = 'var(--ok)'; }
+    else { desc = '详见日志中的开机自检记录。'; }
+    $('bootSourceVal').textContent = title;
+    $('bootSourceVal').style.color = color;
+    $('bootSourceDetail').textContent = desc;
   } else {
     $('bootSource').style.display = 'none';
   }
