@@ -1,7 +1,7 @@
 appname=com.gzywd.kanmendog
-version=1.1.0
+version=1.2.0
 display_name=看门狗 KanmenDog
-desc=检测飞牛 fnOS 死机并自动重启的看门狗守护进程。复用内核看门狗 /dev/watchdog（硬件 iTCO_wdt 或软件 softdog）与 systemd，支持 Web 页面自定义检测参数、查看日志与一键开关。
+desc=检测飞牛 fnOS 死机并自动重启的看门狗守护进程（零误杀优先：升级/重启/开机期绝不误判）。复用内核看门狗与 systemd，支持 Web 页面自定义参数、查看日志与一键开关。
 source=thirdparty
 platform=x86
 maintainer=gzywd
@@ -11,4 +11,4 @@ desktop_uidir=ui
 desktop_applaunchname=com.gzywd.kanmendog.main
 ctl_stop=true
 checkport=false
-changelog=首个版本：看门狗守护进程 + Web 管理页面，检测 fork/负载/D状态/可选探针，判定死机自动重启并记录原因。
+changelog=零误杀重构：停止服务/正常重启前安全解除看门狗；系统升级与关机窗口暂停判定；开机冷却期；判定阈值默认 3 分钟连续异常；探针端口自动探测且默认关闭；内核参数保守化并全量备份恢复。

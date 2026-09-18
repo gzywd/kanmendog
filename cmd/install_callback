@@ -1,5 +1,6 @@
 #!/bin/bash
 # cmd/install_callback —— 安装文件应用后执行：加载看门狗、写内核 lockup 兜底、注册 systemd 服务
+# v1.2.0：零误杀优先 —— sysctl 保守化+全量备份、fnOS 管理端口自动探测、优雅退出单元
 set -u
 
 APPDEST="${TRIM_APPDEST:-/var/apps/com.gzywd.kanmendog/target}"
@@ -39,27 +40,71 @@ if [ -e /dev/watchdog ]; then
     log "看门狗身份: $WID —— 软件看门狗(softdog)：仅覆盖软死机/单核 lockup，全核冻结无法自动复位"
   else
     log "看门狗身份: $WID —— 硬件看门狗：具备硬复位能力（独立于内核）"
+    log "提示：若内核以 nowayout 编译看门狗驱动，停止服务后仍可能在超时后硬复位；正常情况下 magic close 会安全解除"
   fi
 else
   log "无可用看门狗设备：本机不具备硬复位能力。建议加带外物理断电方案（智能插座/ESP32）以覆盖全核冻结"
 fi
 
-# 3) 内核 lockup 检测 → panic → 自动重启（覆盖单核卡死，用户态健康检查测不到它）
-#    备份原 kernel.panic 值，卸载时恢复，避免永久改变整机的 panic 行为
-PREV_PANIC=$(sysctl -n kernel.panic 2>/dev/null)
-echo "${PREV_PANIC:-0}" > "$PKGETC/prev_kernel_panic" 2>/dev/null || true
+# 3) 内核 lockup 检测 → panic → 自动重启
+#    v1.2.0 保守化（零误杀哲学）：
+#      - hardlockup_panic=1：CPU 硬锁死（NMI 级）几乎无误报，保留
+#      - softlockup_panic=0：软锁死在高负载/虚拟化下有假阳性历史，默认关闭
+#        （宁漏勿误：漏掉的软死机仍由用户态健康检查+硬件看门狗覆盖）
+#      - kernel.panic=10：万一发生 panic（任何原因）10 秒后自动重启而非停在 panic 屏
+#      - kernel.watchdog_thresh=20：检测窗口放宽，进一步降低假阳性
+#    四个参数全部备份原值到 PKGETC/sysctl_backup，卸载时逐项恢复（幂等）。
+mkdir -p "$PKGETC" "$PKGVAR"
+SYSCTL_BAK="$PKGETC/sysctl_backup"
+if [ ! -f "$SYSCTL_BAK" ]; then
+  : > "$SYSCTL_BAK" 2>/dev/null || true
+  for k in kernel.panic kernel.softlockup_panic kernel.hardlockup_panic kernel.watchdog_thresh; do
+    v=$(sysctl -n "$k" 2>/dev/null || echo "")
+    if [ -n "$v" ]; then
+      echo "$k=$v" >> "$SYSCTL_BAK"
+    fi
+  done
+  log "已备份原内核参数到 $SYSCTL_BAK（卸载时恢复）"
+fi
 cat > /etc/sysctl.d/99-kanmendog.conf <<'EOF'
-# 由看门狗 KanmenDog 写入：把内核级卡死转化为 panic 并自动重启
-kernel.softlockup_panic = 1
+# 由看门狗 KanmenDog 写入：把内核级卡死转化为 panic 并自动重启（保守配置）
 kernel.hardlockup_panic = 1
+kernel.softlockup_panic = 0
 kernel.watchdog_thresh = 20
-# panic 后 10 秒自动重启。若不设，soft/hardlockup 变为 panic 后会停在 panic 屏而不重启，
-# 而这类单核卡死用户态健康检查无法感知，等于唯一兜底链被切断。
+# panic 后 10 秒自动重启。若不设，lockup 变 panic 后会停在 panic 屏而不重启。
 kernel.panic = 10
 EOF
 sysctl -p /etc/sysctl.d/99-kanmendog.conf >/dev/null 2>&1 || true
 
-# 4) 写入 systemd 服务单元（Restart=always 复用 systemd 作为进程主管）
+# 4) 自动探测 fnOS 管理端口，预填服务探针命令（探针默认仍为关闭，开关交给用户）
+#    fnOS 新版默认 HTTP 5666 / HTTPS 5667，旧版 8000/8001，80 仅为可选重定向。
+#    curl 不带 -f：只要收到 HTTP 响应（含 302/403）即视为服务存活 —— 抗误判。
+detect_fnos_web() {
+  local p
+  for p in 5666 8000 80; do
+    if curl -s -o /dev/null -m 3 "http://127.0.0.1:$p/" 2>/dev/null; then
+      echo "curl -s -o /dev/null -m 5 http://127.0.0.1:$p/"
+      return 0
+    fi
+  done
+  for p in 5667 8001 443; do
+    if curl -sk -o /dev/null -m 3 "https://127.0.0.1:$p/" 2>/dev/null; then
+      echo "curl -sk -o /dev/null -m 5 https://127.0.0.1:$p/"
+      return 0
+    fi
+  done
+  return 1
+}
+PROBE_CMD=""
+if PROBE_CMD=$(detect_fnos_web); then
+  log "已探测到 fnOS 管理 Web 端口并预填探针命令: $PROBE_CMD（探针默认关闭，可在应用页面手动开启）"
+else
+  log "未能自动探测 fnOS 管理 Web 端口：探针命令留空。如需开启探针，请在应用页面配置真实端口（新版默认 5666，旧版 8000/8001，非 80！）"
+fi
+
+# 5) 写入 systemd 服务单元（Restart=always 复用 systemd 作为进程主管）
+#    v1.2.0：KillMode=mixed + TimeoutStopSec=45 —— 停止时 SIGTERM 只发给主进程，
+#    主进程在信号处理器中先 magic close 解除看门狗再退出，杜绝停止后被硬复位。
 cat > /etc/systemd/system/"$SERVICE" <<EOF
 [Unit]
 Description=KanmenDog Watchdog (com.gzywd.kanmendog)
@@ -72,6 +117,8 @@ ExecStart=$APPDEST/kanmendog
 Restart=always
 RestartSec=5
 User=root
+KillMode=mixed
+TimeoutStopSec=45
 WorkingDirectory=$PKGVAR
 Environment=TRIM_PKGETC=$PKGETC TRIM_PKGVAR=$PKGVAR
 StandardOutput=append:$PKGVAR/stdout.log
@@ -81,33 +128,38 @@ StandardError=append:$PKGVAR/stderr.log
 WantedBy=multi-user.target
 EOF
 
-mkdir -p "$PKGETC" "$PKGVAR"
-
-# 5) 写入默认配置
+# 6) 写入默认配置（与程序内置默认完全一致：保守阈值，零误杀优先）
+#    fail_threshold=18（10s 周期 × 18 = 3 分钟连续异常才判定）
+#    探针默认关闭；负载检查默认关闭（高负载≠死机）
 if [ ! -f "$PKGETC/config.json" ]; then
-  cat > "$PKGETC/config.json" <<'EOF'
+  cat > "$PKGETC/config.json" <<EOF
 {
   "enabled": true,
   "interval_sec": 10,
   "watchdog_timeout_sec": 60,
-  "fail_threshold": 3,
+  "fail_threshold": 18,
   "port": 8900,
   "auto_reboot": true,
+  "boot_grace_min": 5,
   "check_fork": true,
-  "check_load": true,
+  "check_load": false,
   "load_threshold": 16,
   "check_dstate": true,
-  "dstate_threshold": 20,
+  "dstate_threshold": 30,
+  "check_memory": true,
+  "mem_available_threshold": 2,
   "check_service_probe": false,
-  "service_probe_cmd": ""
+  "service_probe_cmd": "$PROBE_CMD",
+  "trend_interval": 5
 }
 EOF
-  log "已写入默认配置 $PKGETC/config.json"
+  log "已写入默认配置 $PKGETC/config.json（保守阈值：3 分钟连续异常才判定重启）"
 fi
 
-# 6) 注册并启用服务（开机自启）
+# 7) 注册并启用服务（开机自启）
 systemctl daemon-reload >/dev/null 2>&1
 systemctl enable "$SERVICE" >/dev/null 2>&1
 log "看门狗服务已注册并设为开机自启"
+log "安装完成。默认策略：宁可 3 分钟后才发现死机，绝不误判正常使用/升级/重启。"
 
 exit 0

@@ -42,6 +42,8 @@
   .toast.show { opacity:1; }
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .muted { color:var(--muted); font-size:12px; }
+  .warnbox { background:rgba(245,158,11,.1); border:1px solid rgba(245,158,11,.4); color:var(--warn); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.7; margin:8px 0; }
+  .okbox { background:rgba(34,197,94,.08); border:1px solid rgba(34,197,94,.3); color:var(--ok); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.7; margin:8px 0; }
 </style>
 </head>
 <body>
@@ -67,22 +69,25 @@
 
   <div class="card">
     <h2>参数配置</h2>
+    <div class="okbox">零误杀策略：默认需 <b>3 分钟连续异常</b>（18 个周期）才判定死机；系统升级、关机重启、开机前 5 分钟内<b>绝不判定</b>；高负载检查默认关闭。宁可晚发现，不可误重启。</div>
     <label><span>健康检查/喂狗周期（秒）</span><input type="number" id="interval_sec" min="2" max="300"></label>
     <label><span>看门狗硬件超时（秒）</span><input type="number" id="watchdog_timeout_sec" min="5" max="600"></label>
-    <label><span>连续失败多少次判定死机</span><input type="number" id="fail_threshold" min="1" max="20"></label>
+    <label><span>连续失败多少次判定死机</span><input type="number" id="fail_threshold" min="1" max="120"></label>
+    <label><span>开机冷却期（分钟，期间只喂狗不判定）</span><input type="number" id="boot_grace_min" min="0" max="60"></label>
     <label><span>Web 服务端口</span><input type="number" id="port" min="1" max="65535"></label>
     <label><span>判定死机后自动重启</span><input type="checkbox" id="auto_reboot"></label>
     <hr style="border-color:#232c40">
     <label><span>fork 存活测试</span><input type="checkbox" id="check_fork"></label>
-    <label><span>系统负载测试</span><input type="checkbox" id="check_load"></label>
+    <label><span>系统负载测试（高负载≠死机，建议关）</span><input type="checkbox" id="check_load"></label>
     <label><span>1 分钟负载阈值</span><input type="number" id="load_threshold" step="0.1" min="0"></label>
     <label><span>D状态进程数测试</span><input type="checkbox" id="check_dstate"></label>
     <label><span>D状态进程数阈值</span><input type="number" id="dstate_threshold" min="0" max="500"></label>
     <label><span>内存可用率检查（防 OOM 死机）</span><input type="checkbox" id="check_memory"></label>
     <label><span>可用内存低于该百分比(%)判定异常</span><input type="number" id="mem_available_threshold" min="1" max="100"></label>
     <label><span>趋势日志间隔（周期数，0=关闭）</span><input type="number" id="trend_interval" min="0" max="200"></label>
-    <label><span>外部命令探针（默认探测飞牛本地 Web）</span><input type="checkbox" id="check_service_probe"></label>
-    <label><span>探针命令（返回0即通过）</span><input type="text" id="service_probe_cmd" style="width:280px"></label>
+    <label><span>外部命令探针</span><input type="checkbox" id="check_service_probe"></label>
+    <div class="warnbox">⚠️ <b>开启探针前务必确认：</b>命令中的端口必须是飞牛真实管理端口 —— 新版默认 <b>5666</b>（HTTPS 5667），旧版 8000/8001；<b>80 端口只是可选重定向，可能未开启！</b>端口填错会在约 3 分钟后误判重启系统。安装时已自动探测端口并预填命令，如命令为空请先填好再开启。</div>
+    <label><span>探针命令（返回0即通过）</span><input type="text" id="service_probe_cmd" style="width:280px" placeholder="curl -s -o /dev/null -m 5 http://127.0.0.1:5666/"></label>
     <div class="btns"><button onclick="saveConfig()">保存配置</button><span class="muted">保存即时生效；部分项需重启服务</span></div>
   </div>
 
@@ -129,13 +134,18 @@ async function refresh(){
     <div class="stat"><div class="k">当前负载(1m)</div><div class="val">${s.current_load}</div></div>
     <div class="stat"><div class="k">D状态进程</div><div class="val">${s.dstate_count}</div></div>
     <div class="stat"><div class="k">连续失败</div><div class="val">${s.consecutive_fails}</div></div>
-    <div class="stat"><div class="k">进程 PID</div><div class="val">${s.pid}</div></div>`;
+    <div class="stat"><div class="k">进程 PID</div><div class="val">${s.pid}</div></div>
+    ${s.upgrade_busy ? `<div class="stat"><div class="k">维护窗口</div><div class="val" style="font-size:13px;color:var(--warn)">${esc(s.upgrade_busy)}</div></div>` : ''}
+    ${s.in_boot_grace ? `<div class="stat"><div class="k">开机冷却期</div><div class="val" style="font-size:13px;color:var(--warn)">冷却中（不判定）</div></div>` : ''}`;
   $('enabledSw').checked = s.enabled;
-  $('enabledTxt').textContent = s.enabled ? '监控进行中，检测到死机将自动重启' : '监控已暂停';
+  let mode = s.enabled ? '监控进行中，连续异常达阈值将自动重启' : '监控已暂停';
+  if (s.in_boot_grace) mode = '开机冷却期内：只喂狗不判定（防开机误判）';
+  if (s.upgrade_busy) mode = '维护窗口：' + s.upgrade_busy + '（继续喂狗，不判定）';
+  $('enabledTxt').textContent = mode;
   if (s.last_reboot_reason) $('stats').insertAdjacentHTML('beforeend',
     `<div class="stat"><div class="k">上次重启原因</div><div class="val" style="font-size:13px">${esc(s.last_reboot_reason.split('\n')[1]||s.last_reboot_reason)}</div></div>`);
   const c = await (await fetch('/api/config')).json();
-  for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','port','load_threshold','dstate_threshold','mem_available_threshold','trend_interval'])
+  for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','boot_grace_min','port','load_threshold','dstate_threshold','mem_available_threshold','trend_interval'])
     $(k).value = c[k];
   for (const k of ['auto_reboot','check_fork','check_load','check_dstate','check_service_probe','check_memory'])
     $(k).checked = c[k];
@@ -145,7 +155,7 @@ function esc(s){ return (s||'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>'
 
 async function saveConfig(){
   const c = {};
-  for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','port','load_threshold','dstate_threshold','mem_available_threshold','trend_interval'])
+  for (const k of ['interval_sec','watchdog_timeout_sec','fail_threshold','boot_grace_min','port','load_threshold','dstate_threshold','mem_available_threshold','trend_interval'])
     c[k] = Number($(k).value);
   for (const k of ['auto_reboot','check_fork','check_load','check_dstate','check_service_probe','check_memory'])
     c[k] = $(k).checked;

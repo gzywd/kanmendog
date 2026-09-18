@@ -1,17 +1,34 @@
 #!/bin/bash
-# cmd/uninstall_callback —— 卸载清理：停服务、删单元、恢复内核参数
+# cmd/uninstall_callback —— 卸载清理：停服务、删单元、恢复内核参数（全量+幂等）
+# v1.2.0：按 sysctl_backup 逐项恢复四个内核参数；兼容 1.1.x 的 prev_kernel_panic 备份。
 set -u
 
 SERVICE="com.gzywd.kanmendog.service"
 PKGETC="${TRIM_PKGETC:-/etc/kanmendog}"
 
-# 先停止服务（若支持 magic close，看门狗会安全解除，不会触发复位）
+# 先停止服务：主进程收到 SIGTERM 后会先 magic close 解除看门狗再退出，
+# 因此正常情况下卸载不会触发看门狗硬复位（除非内核以 nowayout 编译驱动）。
 systemctl disable --now "$SERVICE" >/dev/null 2>&1
 
 rm -f /etc/systemd/system/"$SERVICE"
 systemctl daemon-reload >/dev/null 2>&1
 
-# 移除内核 lockup 兜底，并恢复 kernel.panic 原值（不强加整机 panic 行为改变）
+# 恢复内核参数（幂等：逐项恢复 sysctl_backup 中的原值）
+if [ -f "$PKGETC/sysctl_backup" ]; then
+  while IFS='=' read -r k v; do
+    [ -n "$k" ] && [ -n "$v" ] && sysctl -w "$k=$v" >/dev/null 2>&1
+  done < "$PKGETC/sysctl_backup"
+  log_msg="已按备份恢复内核参数"
+else
+  # 无备份（异常卸载/备份丢失）：恢复 Debian 默认值，避免参数永久残留
+  sysctl -w "kernel.panic=0" >/dev/null 2>&1
+  sysctl -w "kernel.softlockup_panic=0" >/dev/null 2>&1
+  sysctl -w "kernel.hardlockup_panic=0" >/dev/null 2>&1
+  sysctl -w "kernel.watchdog_thresh=10" >/dev/null 2>&1
+  log_msg="未找到 sysctl 备份，已恢复内核默认值"
+fi
+
+# 兼容 1.1.x 旧版备份文件（仅 kernel.panic）
 if [ -f "$PKGETC/prev_kernel_panic" ]; then
   PREV=$(cat "$PKGETC/prev_kernel_panic" 2>/dev/null)
   if [ -n "$PREV" ]; then
@@ -19,8 +36,10 @@ if [ -f "$PKGETC/prev_kernel_panic" ]; then
   fi
   rm -f "$PKGETC/prev_kernel_panic"
 fi
-rm -f /etc/sysctl.d/99-kanmendog.conf
+
+rm -f "$PKGETC/sysctl_backup" /etc/sysctl.d/99-kanmendog.conf
 
 # 注意：保留 PKGVAR 下的日志与 last_reboot_reason，便于事后排查；
 # 如需彻底清理可手动删除对应目录。
+echo "[uninstall] $log_msg；sysctl 文件已移除" >> "${TRIM_TEMP_LOGFILE:-/tmp/kanmendog-install.log}" 2>/dev/null || true
 exit 0
