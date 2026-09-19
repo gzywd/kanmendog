@@ -82,7 +82,8 @@
 
 ### 方式一：飞牛应用中心手动安装（推荐）
 
-1. 下载最新的 `.fpk` 文件
+1. 下载对应版本的 `.fpk` 文件（以 [Release v1.9.0](https://github.com/gzywd/kanmendog/releases/tag/v1.9.0) 为例）：
+   `https://github.com/gzywd/kanmendog/releases/download/v1.9.0/com.gzywd.kanmendog-v1.9.0.fpk`
 2. 飞牛应用中心 → 手动安装 → 选择 fpk
 3. 安装向导会询问是否启用 Web 探针（已自动探测端口）
 4. 打开应用页面确认状态
@@ -90,11 +91,11 @@
 ### 方式二：命令行安装
 
 ```bash
-# 下载最新 release
-wget https://github.com/gzywd/kanmendog/releases/latest/download/com.gzywd.kanmendog.fpk
+# 下载 v1.9.0 release 包（文件名含版本号）
+wget https://github.com/gzywd/kanmendog/releases/download/v1.9.0/com.gzywd.kanmendog-v1.9.0.fpk
 
-# 通过 fnpack 安装（需要 fnOS 环境）
-fnos install com.gzywd.kanmendog.fpk
+# 通过 fnOS 命令安装（需要 fnOS 环境）
+fnos install com.gzywd.kanmendog-v1.9.0.fpk
 ```
 
 ## 配置说明
