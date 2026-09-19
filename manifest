@@ -1,5 +1,5 @@
 appname=com.gzywd.kanmendog
-version=1.4.0
+version=1.9.0
 display_name=看门狗 KanmenDog
 desc=检测飞牛 fnOS 死机并自动重启的看门狗守护进程（零误杀优先：升级/重启/开机期绝不误判）。复用内核看门狗与 systemd，支持 Web 页面自定义参数、查看日志与一键开关。
 source=thirdparty
@@ -9,6 +9,7 @@ maintainer_url=https://github.com/gzywd/kanmendog
 os_min_version=1.2.0
 desktop_uidir=ui
 desktop_applaunchname=com.gzywd.kanmendog.main
+service_port=8900
 ctl_stop=true
 checkport=false
-changelog=v1.4.0 修复安装后三大失效问题：配置合并模式（旧版升级不再丢失默认值）、UI 全面错误处理（不再静默崩溃）、服务控制兼容非 systemd 环境、启动顺序优化（页面秒开）、日志磁盘回退、健康检查诊断端点。
+changelog=v1.9.0 质量审计修复：①页面「保存不生效」修复——自动刷新只更新状态不再覆盖参数表单；②D 状态检查默认关闭（防 mdadm scrub/rsync/虚拟机直通误杀）；③死机判定改为「≥2 个独立检查族同时失败」才计一次，单检查超时按弃权处理，杜绝「慢=失败」累积；④triggerReboot 硬件兜底重写（保持 fd 打开+停喂狗，按 reboot 阶梯兜底，不再盲目 close 导致 nowayout 下失活）；⑤维护窗口最长 60 分钟自动退场，常驻进程锁死不再永久静默；⑥全 goroutine 加 recover() 防 panic 致死；⑦日志按分钟轮转；⑧接口绑定 127.0.0.1 + 同源/CSRF 校验 + 探针命令白名单，堵住无鉴权与任意 root 命令注入；⑨修数据竞争（go test -race 确认）；⑩安装向导补回探针开关、版本号统一、二进制 strip。v1.8.3 修复域名反代/子路径访问打不开的问题：前端按当前页面真实路径动态计算 API 前缀（兼容直接访问、fnOS 网关、任意 nginx/隧道子路径三种方式），后端同步兼容「反代是否 strip 前缀」两种转发，并对 /favicon.ico 返回 204。v1.8.2 修复 UI fetch 语法错误与看门狗 /dev/watchdog0 回退、卸载 nowayout 警告。v1.8.1 修复 ui/config 打开飞牛桌面并强化看门狗类型显示。v1.8.0 网关接入+自定义端口保存修复。v1.7.3 修复自定义端口输入框闪退。

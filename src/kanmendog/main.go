@@ -1,5 +1,22 @@
 // 看门狗 KanmenDog —— fnOS 死机自动重启守护进程
 //
+// v1.8.1 严重 Bug 修复 + 增强：（1）修复 ui/config 未声明 port 导致 fnOS 回退到飞牛默认端口 5666、打开时弹出飞牛桌面的严重 bug——现正确声明 port=8900，fnOS 直连应用自身 Web 服务；Go 路由同时兼容 /apps/{appname}/main/ 反代前缀，飞牛 App 远程亦可打开；（2）UI 强化看门狗类型显示：明确区分硬件看门狗（内核冻结可硬复位，真兜底）/软件看门狗 softdog（内核冻结无法复位，无真兜底）/无设备，并展示 nowayout 锁定状态。
+// v1.8.0 网关接入 + 修复：（1）接入飞牛网关——ui/config 不声明 port（此方案在部分 fnOS 版本会回退 5666，v1.8.1 已纠正为显式声明 port）；（2）修复自定义端口保存 bug。
+//
+// v1.7.2 体验优化：（1）关机检测加运行时间过滤，防止 /run/systemd/shutdown 残留导致误报；（2）探针端口选择器支持自定义端口输入（如 16666），自动生成 curl 命令。
+// v1.7.1 Bug 修复：修复 querySelector CSS 选择器语法错误（属性选择器需 [value="..."] 格式）
+// v1.7.0 Bug 修复（输入框 Enter 键防刷新 + 探针命令按 Enter 自动保存）：
+//   - 全局拦截 input/select 的 Enter 键，防止浏览器隐式表单提交导致页面刷新
+//   - 探针命令输入框按 Enter 时自动触发保存（便利操作）
+//
+// v1.6.0 规范修复（卸载流程符合 fnOS 官方规范）：
+//   - 【规范】卸载流程重构：uninstall_init 优雅停进程（magic close 看门狗），
+//     uninstall_callback 仅负责清理单元/内核参数/条件删数据。
+//   - 【规范】wizard/uninstall 新增"删除应用数据"开关（uninstall_purge_data），
+//     用户在卸载向导中直接选择，符合官方"在 wizard 中收集选择"的推荐做法。
+//   - 【规范】manifest 新增 service_port=8900 声明。
+//   - 【工程】构建脚本增加自动编译步骤，杜绝"旧二进制被打包"的问题。
+//
 // v1.5.0 体验修复（默认值一致性 + 重启来源友好化 + 探针 UX 重构）：
 //   - 【体验】classifyBoot 无法判定时（wtmp/last 不可用）默认为"正常关机后开机"
 //     而非显示吓人的"未知" —— fnOS 绝大多数重启是用户主动操作，
@@ -55,11 +72,12 @@
 //   - 趋势日志按大小滚动；暂停监控每日提醒一次。
 //
 // v1.2.0 设计哲学（零误杀优先，继续有效）：
-//   宁可 3 分钟后发现异常，绝不把正常使用/升级/重启误判成死机。
-//   - 停止服务/正常关机重启先 magic close 解除看门狗（SIGTERM 处理器）。
-//   - 升级（dpkg 锁/升级进程）/关机流程/开机冷却期/手动维护模式：只喂狗不判定。
-//   - 判定与喂狗解耦：失败期间持续喂狗，达阈值决定重启才停喂。
-//   - 默认 18 个周期（3 分钟）连续异常才判定；负载检查默认关；内存阈值 2%。
+//
+//	宁可 3 分钟后发现异常，绝不把正常使用/升级/重启误判成死机。
+//	- 停止服务/正常关机重启先 magic close 解除看门狗（SIGTERM 处理器）。
+//	- 升级（dpkg 锁/升级进程）/关机流程/开机冷却期/手动维护模式：只喂狗不判定。
+//	- 判定与喂狗解耦：失败期间持续喂狗，达阈值决定重启才停喂。
+//	- 默认 18 个周期（3 分钟）连续异常才判定；负载检查默认关；内存阈值 2%。
 package main
 
 import (
@@ -68,11 +86,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,38 +102,56 @@ import (
 	"unsafe"
 )
 
-//go:embed ui/index.html
+//go:embed ui/index.html ui/config ui/images
 var uiFS embed.FS
 
 const (
 	appName        = "com.gzywd.kanmendog"
-	appVersion     = "1.5.0"
+	appVersion     = "1.9.0"
 	defaultPort    = 8900
 	watchdogDevice = "/dev/watchdog"
 	logMaxBytes    = 5 * 1024 * 1024  // 日志滚动阈值
 	trendMaxBytes  = 20 * 1024 * 1024 // 趋势 csv 滚动阈值
+	// 维护窗口连续占用上限：超过则强制退出维护状态并告警，防止被常驻进程永久锁死
+	maxBusyDuration = 60 * time.Minute
+	// 探针学习期最大宽容次数：前 N 次失败不计入判定（有退出条件，避免静默废掉探针）
+	probeLearnLimit = 3
 )
+
+// 看门狗 ioctl 编号（'W' = 0x57）
+const (
+	wdIOCGetSupport = 0x80285700 // _IOR('W',0,struct watchdog_info)
+	wdOptMagicClose = 0x08       // WDIOF_MAGICCLOSE：close 时若未写 'V' 则保持看门狗运行
+	wdOptNoWayOut   = 0x0020     // WDIOF_NO_WAY_OUT：nowayout，close 也停不下来
+)
+
+// watchdogInfo 对应内核 struct watchdog_info
+type watchdogInfo struct {
+	Options  uint32
+	Firmware uint32
+	Identity [32]byte
+}
 
 // Config 应用配置，持久化到 TRIM_PKGETC/config.json
 type Config struct {
-	Enabled               bool    `json:"enabled"`                // 监控总开关（网页一键开关）
-	IntervalSec           int     `json:"interval_sec"`           // 健康检查/喂狗周期
-	WatchdogTimeoutSec    int     `json:"watchdog_timeout_sec"`   // 看门狗硬件超时（ioctl 设置，非所有驱动支持）
-	FailThreshold         int     `json:"fail_threshold"`         // 连续失败多少次判定死机（默认18=3分钟）
-	Port                  int     `json:"port"`                   // Web 服务端口
-	AutoReboot            bool    `json:"auto_reboot"`            // 判定死机后是否自动重启
-	BootGraceMin          int     `json:"boot_grace_min"`         // 开机冷却期（分钟）：期间只喂狗不判定
-	CheckFork             bool    `json:"check_fork"`             // fork 存活测试（零误报）
-	CheckLoad             bool    `json:"check_load"`             // 负载测试（高负载≠死机，默认关）
-	LoadThreshold         float64 `json:"load_threshold"`         // 1 分钟负载均值阈值
-	CheckDState           bool    `json:"check_dstate"`           // 不可中断(D)进程数测试
-	DStateThreshold       int     `json:"dstate_threshold"`       // D 状态进程数阈值
-	CheckMemory           bool    `json:"check_memory"`           // 内存可用率测试（针对 OOM 死机）
+	Enabled               bool    `json:"enabled"`                 // 监控总开关（网页一键开关）
+	IntervalSec           int     `json:"interval_sec"`            // 健康检查/喂狗周期
+	WatchdogTimeoutSec    int     `json:"watchdog_timeout_sec"`    // 看门狗硬件超时（ioctl 设置，非所有驱动支持）
+	FailThreshold         int     `json:"fail_threshold"`          // 连续失败多少次判定死机（默认18=3分钟）
+	Port                  int     `json:"port"`                    // Web 服务端口
+	AutoReboot            bool    `json:"auto_reboot"`             // 判定死机后是否自动重启
+	BootGraceMin          int     `json:"boot_grace_min"`          // 开机冷却期（分钟）：期间只喂狗不判定
+	CheckFork             bool    `json:"check_fork"`              // fork 存活测试（零误报）
+	CheckLoad             bool    `json:"check_load"`              // 负载测试（高负载≠死机，默认关）
+	LoadThreshold         float64 `json:"load_threshold"`          // 1 分钟负载均值阈值
+	CheckDState           bool    `json:"check_dstate"`            // 不可中断(D)进程数测试
+	DStateThreshold       int     `json:"dstate_threshold"`        // D 状态进程数阈值
+	CheckMemory           bool    `json:"check_memory"`            // 内存可用率测试（针对 OOM 死机）
 	MemAvailableThreshold int     `json:"mem_available_threshold"` // 可用内存低于该百分比(%)判定异常
-	CheckServiceProbe     bool    `json:"check_service_probe"`    // 外部命令探针（默认关！端口须与飞牛一致）
-	ServiceProbeCmd       string  `json:"service_probe_cmd"`      // 必须返回 0 的命令
-	TrendInterval         int     `json:"trend_interval"`         // 趋势日志间隔（周期数，0=关闭）
-	MaintainUntil         int64   `json:"maintain_until"`         // 手动维护模式截止时刻（unix 秒，0=无；期间只喂狗不判定）
+	CheckServiceProbe     bool    `json:"check_service_probe"`     // 外部命令探针（默认关！端口须与飞牛一致）
+	ServiceProbeCmd       string  `json:"service_probe_cmd"`       // 必须返回 0 的命令
+	TrendInterval         int     `json:"trend_interval"`          // 趋势日志间隔（周期数，0=关闭）
+	MaintainUntil         int64   `json:"maintain_until"`          // 手动维护模式截止时刻（unix 秒，0=无；期间只喂狗不判定）
 }
 
 // defaultConfig 保守默认值：宁可晚 3 分钟发现死机，绝不误杀正常负载。
@@ -120,17 +159,21 @@ type Config struct {
 // 80 仅是可选的重定向）。安装向导会让用户知情勾选，安装脚本探测端口后预填命令。
 func defaultConfig() Config {
 	return Config{
-		Enabled:               true,
-		IntervalSec:           10,
-		WatchdogTimeoutSec:    60,
-		FailThreshold:         18, // 10s 周期 × 18 = 3 分钟连续异常才判定
-		Port:                  defaultPort,
-		AutoReboot:            true,
-		BootGraceMin:          5, // 开机 5 分钟内只喂狗不判定
-		CheckFork:             true,
-		CheckLoad:             false, // 高负载不等于死机，默认关闭
-		LoadThreshold:         16,
-		CheckDState:           true,
+		Enabled:            true,
+		IntervalSec:        10,
+		WatchdogTimeoutSec: 60,
+		FailThreshold:      18, // 10s 周期 × 18 = 3 分钟连续异常才判定
+		Port:               defaultPort,
+		AutoReboot:         true,
+		BootGraceMin:       5, // 开机 5 分钟内只喂狗不判定
+		CheckFork:          true,
+		CheckLoad:          false, // 高负载不等于死机，默认关闭
+		LoadThreshold:      16,
+		// v1.9.0：D 状态检查默认关闭。D 状态进程数在 mdadm scrub / 大批量 rsync /
+		// Docker·VM 存储透传时常态性偏高并持续数分钟——这正是 README 强调要规避的
+		// "高负载≠死机"场景。它比负载检查更容易误杀，故与负载检查一致默认关闭，
+		// 由用户在知情后手动开启。若开启，仍受"≥2 独立检查族同时失败才计数"保护。
+		CheckDState:           false,
 		DStateThreshold:       30,
 		CheckMemory:           true,
 		MemAvailableThreshold: 2, // page cache 可回收；2% 持续 3 分钟才是真耗尽
@@ -150,8 +193,8 @@ func envOr(env, fallback string) string {
 	return fallback
 }
 
-func (c *Config) etcDir() string  { return envOr("TRIM_PKGETC", "/etc/kanmendog") }
-func (c *Config) varDir() string  { return envOr("TRIM_PKGVAR", "/var/lib/kanmendog") }
+func (c *Config) etcDir() string { return envOr("TRIM_PKGETC", "/etc/kanmendog") }
+func (c *Config) varDir() string { return envOr("TRIM_PKGVAR", "/var/lib/kanmendog") }
 func (c *Config) configPath() string {
 	return filepath.Join(c.etcDir(), "config.json")
 }
@@ -273,12 +316,13 @@ func logDaily(key, msg string) { logThrottledEvery(key, 24*time.Hour, msg) }
 // ---- 看门狗 ----
 
 type watchdog struct {
-	fd int
+	fd     int
+	device string
 }
 
 // ioctl 编号（'W' = 0x57）
 const (
-	wdIOCKeepAlive  = 0x5705      // _IO('W',5)
+	wdIOCKeepAlive  = 0x5705     // _IO('W',5)
 	wdIOCSetTimeout = 0xC0045706 // _IOWR('W',6,sizeof(int))
 	wdIOCGetTimeout = 0x80045707 // _IOR('W',7,sizeof(int))
 )
@@ -301,29 +345,39 @@ func ioctlGetIntVal(fd int, req uint) (int, error) {
 	return v, nil
 }
 
+var watchdogDevices = []string{"/dev/watchdog", "/dev/watchdog0"}
+
 func openWatchdog(timeoutSec int) (w *watchdog, actualTimeout int, err error) {
-	fd, err := syscall.Open(watchdogDevice, syscall.O_WRONLY, 0)
-	if err != nil {
-		return nil, 0, fmt.Errorf("打开 %s 失败: %v", watchdogDevice, err)
+	var lastErr error
+	for _, dev := range watchdogDevices {
+		fd, err := syscall.Open(dev, syscall.O_WRONLY, 0)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		w = &watchdog{fd: fd, device: dev}
+		if timeoutSec > 0 {
+			// 尽力设置超时；不支持的驱动会忽略
+			t := timeoutSec
+			_ = ioctlSetIntPtr(fd, wdIOCSetTimeout, &t)
+		}
+		// 回读驱动实际生效的超时（iTCO 部分固件只支持档位值）
+		if v, err := ioctlGetIntVal(fd, wdIOCGetTimeout); err == nil && v > 0 {
+			actualTimeout = v
+		} else {
+			actualTimeout = timeoutSec
+		}
+		// 立即喂一次，确认设备可用
+		if err := w.pet(); err != nil {
+			syscall.Close(fd)
+			w = nil
+			lastErr = err
+			continue
+		}
+		logf("看门狗设备已选择: %s", dev)
+		return w, actualTimeout, nil
 	}
-	w = &watchdog{fd: fd}
-	if timeoutSec > 0 {
-		// 尽力设置超时；不支持的驱动会忽略
-		t := timeoutSec
-		_ = ioctlSetIntPtr(fd, wdIOCSetTimeout, &t)
-	}
-	// 回读驱动实际生效的超时（iTCO 部分固件只支持档位值）
-	if v, err := ioctlGetIntVal(fd, wdIOCGetTimeout); err == nil && v > 0 {
-		actualTimeout = v
-	} else {
-		actualTimeout = timeoutSec
-	}
-	// 立即喂一次，确认设备可用
-	if err := w.pet(); err != nil {
-		syscall.Close(fd)
-		return nil, 0, err
-	}
-	return w, actualTimeout, nil
+	return nil, 0, fmt.Errorf("打开看门狗失败（已尝试 %v）: %v", watchdogDevices, lastErr)
 }
 
 func (w *watchdog) pet() error {
@@ -382,8 +436,13 @@ func fnosUpdaterLike(comm string) bool {
 // 窗口内若系统真冻结，喂狗进程随之冻结，硬件看门狗自然兜底，两不误。
 func systemBusyReason() string {
 	// 1) systemd 正在执行关机/重启流程：此时 Web 等服务陆续停止，探针/负载必然异常
+	//     但 /run/systemd/shutdown 可能因上次关机中断（断电等）而残留，
+	//     所以仅当系统刚启动不久（< 5 分钟）时才视为真正的关机流程
 	if fi, err := os.Stat("/run/systemd/shutdown"); err == nil && fi.IsDir() {
-		return "systemd 正在关机/重启流程中"
+		if uptimeMinutes() < 5 {
+			return "systemd 正在关机/重启流程中"
+		}
+		// 运行已超 5 分钟但 shutdown 目录仍在：可能是残留，忽略
 	}
 	// 2) dpkg 锁被占用（fnOS 基于 Debian，系统升级走 apt/dpkg，锁必然持有）
 	for _, lock := range []string{"/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock"} {
@@ -398,7 +457,8 @@ func systemBusyReason() string {
 	return ""
 }
 
-// dpkgLockHeld 用 fcntl 写锁探测 dpkg 锁是否被占用（dpkg 使用 POSIX fcntl 锁而非 flock）
+// dpkgLockHeld 用 fcntl 查询（F_GETLK，纯查询无副作用）dpkg 锁是否被占用。
+// dpkg 使用 POSIX fcntl 锁而非 flock；用 F_GETLK 而非 F_SETLK 抢锁，避免与 apt 之间的 TOCTOU 竞态。
 func dpkgLockHeld(path string) bool {
 	fd, err := syscall.Open(path, syscall.O_RDWR, 0)
 	if err != nil {
@@ -407,12 +467,12 @@ func dpkgLockHeld(path string) bool {
 	defer syscall.Close(fd)
 	const seekSet = 0 // SEEK_SET
 	lk := syscall.Flock_t{Type: syscall.F_WRLCK, Whence: seekSet, Start: 0, Len: 0}
-	if err := syscall.FcntlFlock(uintptr(fd), syscall.F_SETLK, &lk); err != nil {
-		return true // EAGAIN/EACCES：锁被他人持有
+	// F_GETLK 把冲突的锁信息写回 lk；若无冲突，lk.Type 被内核置为 F_UNLCK
+	if err := syscall.FcntlFlock(uintptr(fd), syscall.F_GETLK, &lk); err != nil {
+		return false
 	}
-	ul := syscall.Flock_t{Type: syscall.F_UNLCK, Whence: seekSet, Start: 0, Len: 0}
-	_ = syscall.FcntlFlock(uintptr(fd), syscall.F_SETLK, &ul)
-	return false
+	// Type 仍为 F_WRLCK 表示存在冲突持有者
+	return lk.Type == syscall.F_WRLCK
 }
 
 // processBusyMatch 扫描 /proc/*/comm，精确匹配升级进程名 + 飞牛升级器前缀匹配
@@ -465,11 +525,11 @@ func uptimeMinutes() float64 {
 type bootKind string
 
 const (
-	bootApp       bootKind = "app"       // 本程序判定死机触发
-	bootPanic     bootKind = "panic"     // 内核 panic（lockup→panic 路径）
-	bootAbnormal  bootKind = "abnormal"  // 无干净关机记录：疑似硬件看门狗复位/断电/冻结
-	bootNormal    bootKind = "normal"    // 正常关机后开机
-	bootUnknown   bootKind = "unknown"   // 无法判定（last/journalctl 不可用）：默认视为正常
+	bootApp      bootKind = "app"      // 本程序判定死机触发
+	bootPanic    bootKind = "panic"    // 内核 panic（lockup→panic 路径）
+	bootAbnormal bootKind = "abnormal" // 无干净关机记录：疑似硬件看门狗复位/断电/冻结
+	bootNormal   bootKind = "normal"   // 正常关机后开机
+	bootUnknown  bootKind = "unknown"  // 无法判定（last/journalctl 不可用）：默认视为正常
 )
 
 var bootKindTitle = map[bootKind]string{
@@ -481,19 +541,21 @@ var bootKindTitle = map[bootKind]string{
 }
 
 // parseLastShutdownTime 解析 `last -x -F shutdown` 最新一条 shutdown 记录的时间。
-// 输出形如：`shutdown system down  Wed Sep 17 09:12:34 2026`（-F 全时间格式）
+// 兼容 util-linux 的 -F 全时间格式及其后可能附加的 " - crash (00:17)" 等后缀，
+// 不再依赖"最后 5 个字段"的脆弱切片（该切法在 crash 后缀下会取到垃圾）。
+// 配合 classifyBoot 中强制 LC_ALL=C，避免中文 locale 下 weekday/month 解析失败。
+var shutdownTimeRe = regexp.MustCompile(`(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}`)
+
 func parseLastShutdownTime(out string) (time.Time, bool) {
 	for _, line := range strings.Split(out, "\n") {
 		if !strings.HasPrefix(line, "shutdown") {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 6 {
+		m := shutdownTimeRe.FindString(line)
+		if m == "" {
 			continue
 		}
-		// 时间字段为最后 5 个：周 月 日 时:分:秒 年
-		ts := strings.Join(fields[len(fields)-5:], " ")
-		if t, err := time.Parse("Mon Jan _2 15:04:05 2006", ts); err == nil {
+		if t, err := time.Parse("Mon Jan _2 15:04:05 2006", m); err == nil {
 			return t, true
 		}
 	}
@@ -514,11 +576,12 @@ func lastBootHadPanic() bool {
 }
 
 // classifyBoot 分析本次重启来源：
-//   1) last_reboot_reason 的时间戳落在本次开机前 30 分钟内 → 本程序判定触发；
-//   2) 最近一次 wtmp shutdown 记录在本次开机前 10 分钟内 → 正常关机；
-//   3) journalctl 上次 boot 内核日志含 panic → panic 重启；
-//   4) 有 shutdown 记录但距离太远 → 异常重启（疑似断电/复位）；
-//   5) 否则（含 wtmp/last 不可用）→ 默认正常（证据优先：无异常证据=正常）。
+//  1. last_reboot_reason 的时间戳落在本次开机前 30 分钟内 → 本程序判定触发；
+//  2. 最近一次 wtmp shutdown 记录在本次开机前 10 分钟内 → 正常关机；
+//  3. journalctl 上次 boot 内核日志含 panic → panic 重启；
+//  4. 有 shutdown 记录但距离太远 → 异常重启（疑似断电/复位）；
+//  5. 否则（含 wtmp/last 不可用）→ 默认正常（证据优先：无异常证据=正常）。
+//
 // 结果写入 boot_reason 文件（状态页优先展示它而非旧的 last_reboot_reason，
 // 消除"硬件复位后旧原因误导排查方向"的问题）。
 func (d *daemon) classifyBoot() {
@@ -543,7 +606,9 @@ func (d *daemon) classifyBoot() {
 	// 2) 正常关机？（有 wtmp shutdown 记录且时间吻合）
 	if kind == bootNormal {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		out, err := exec.CommandContext(ctx, "last", "-x", "-F", "shutdown").Output()
+		cmd := exec.CommandContext(ctx, "last", "-x", "-F", "shutdown")
+		cmd.Env = append(os.Environ(), "LC_ALL=C") // 强制英文输出，避免中文 locale 下时间解析失败
+		out, err := cmd.Output()
 		cancel()
 		if err == nil {
 			if st, ok := parseLastShutdownTime(string(out)); ok {
@@ -593,17 +658,19 @@ func (d *daemon) classifyBoot() {
 // ---- 健康检查 ----
 
 type checkResult struct {
-	Name   string `json:"name"`
-	OK     bool   `json:"ok"`
-	Detail string `json:"detail"`
+	Name    string `json:"name"`
+	OK      bool   `json:"ok"`
+	Detail  string `json:"detail"`
+	Family  string `json:"family"`  // 检查族：用于法定人数规则（≥2 族同时失败才计数）
+	Timeout bool   `json:"timeout"` // 是否因基础设施超时（慢）而失败：按"弃权"处理，不增不减 failCount
 }
 
 // runFork 尝试 fork 一个新进程；内核调度挂死会失败
 func runFork(ctx context.Context) checkResult {
-	r := checkResult{Name: "fork 存活", OK: true}
+	r := checkResult{Name: "fork 存活", OK: true, Family: "sched"}
 	done := make(chan error, 1)
 	go func() {
-		cmd := exec.Command("/bin/true")
+		cmd := exec.CommandContext(ctx, "/bin/true")
 		done <- cmd.Run()
 	}()
 	select {
@@ -612,14 +679,14 @@ func runFork(ctx context.Context) checkResult {
 			r.OK, r.Detail = false, fmt.Sprintf("fork/exec 失败: %v", err)
 		}
 	case <-ctx.Done():
-		r.OK, r.Detail = false, "fork 测试超时（调度可能卡死）"
+		r.OK, r.Detail, r.Timeout = false, "fork 测试超时（调度可能卡死）", true
 	}
 	return r
 }
 
 // runLoad 读取 /proc/loadavg 的一分钟负载
 func runLoad(ctx context.Context, threshold float64) checkResult {
-	r := checkResult{Name: "系统负载", OK: true}
+	r := checkResult{Name: "系统负载", OK: true, Family: "pressure"}
 	done := make(chan string, 1)
 	go func() {
 		b, err := os.ReadFile("/proc/loadavg")
@@ -646,14 +713,14 @@ func runLoad(ctx context.Context, threshold float64) checkResult {
 			r.OK = false
 		}
 	case <-ctx.Done():
-		r.OK, r.Detail = false, "读取负载超时"
+		r.OK, r.Detail, r.Timeout = false, "读取负载超时", true
 	}
 	return r
 }
 
 // runDState 统计不可中断(D)状态进程数
 func runDState(ctx context.Context, threshold int) checkResult {
-	r := checkResult{Name: "D状态进程", OK: true}
+	r := checkResult{Name: "D状态进程", OK: true, Family: "pressure"}
 	done := make(chan struct {
 		n   int
 		top string
@@ -705,16 +772,16 @@ func runDState(ctx context.Context, threshold int) checkResult {
 			r.OK = false
 		}
 	case <-ctx.Done():
-		r.OK, r.Detail = false, "扫描 /proc 超时"
+		r.OK, r.Detail, r.Timeout = false, "扫描 /proc 超时", true
 	}
 	return r
 }
 
 // runServiceProbe 运行用户命令，必须返回 0。
 // 注意：命令里的端口/地址必须与飞牛真实管理端口一致，否则会误判！
-// 学习期保护：探针从未成功过之前，失败不计入判定（见 loop）。
+// 学习期保护：探针前几次失败不计入判定（见 loop）。
 func runServiceProbe(ctx context.Context, cmdStr string) checkResult {
-	r := checkResult{Name: "服务探针", OK: true, Detail: cmdStr}
+	r := checkResult{Name: "服务探针", OK: true, Detail: cmdStr, Family: "web"}
 	if cmdStr == "" {
 		r.OK = true
 		r.Detail = "未配置命令"
@@ -768,7 +835,7 @@ func probeCandidatePorts() int {
 // runMemory 检查内存可用率；可用率低于阈值(%)判定异常，直接命中 OOM 类死机。
 // 若内核未提供 MemAvailable（老内核）则跳过判定，不误杀。
 func runMemory(ctx context.Context, thresholdPct int) checkResult {
-	r := checkResult{Name: "内存可用率", OK: true}
+	r := checkResult{Name: "内存可用率", OK: true, Family: "mem"}
 	type mem struct {
 		availPct float64
 		availMB  float64
@@ -818,7 +885,7 @@ func runMemory(ctx context.Context, thresholdPct int) checkResult {
 			r.Detail = fmt.Sprintf("可用 %.1f%%（%.0f/%.0f MB）", m.availPct, m.availMB, m.totalMB)
 		}
 	case <-ctx.Done():
-		r.OK, r.Detail = false, "读取 /proc/meminfo 超时"
+		r.OK, r.Detail, r.Timeout = false, "读取 /proc/meminfo 超时", true
 	}
 	return r
 }
@@ -853,8 +920,10 @@ func readWatchdogIdentity() string {
 			return strings.TrimSpace(string(b))
 		}
 	}
-	if _, err := os.Stat(watchdogDevice); err == nil {
-		return "unknown(dev-exists)"
+	for _, dev := range watchdogDevices {
+		if _, err := os.Stat(dev); err == nil {
+			return "unknown(dev-exists)"
+		}
 	}
 	return "none"
 }
@@ -869,6 +938,21 @@ func readNowayout() bool {
 		}
 	}
 	return false
+}
+
+// wdSupportsMagicClose 查询看门狗驱动能力（WDIOC_GETSUPPORT）。
+// 返回 true 表示：close 时若未写 'V'（magic close），看门狗仍保持运行；
+// 或内核以 nowayout 编译，close 也无法解除。两种情况都满足"停喂即硬复位"的前提，
+// 即决定重启时关闭 fd 是安全的（硬件倒计时继续）。否则 close 会直接解除看门狗，
+// 必须改为保持 fd 打开、停止喂狗，并依赖 reboot/sysrq 兜底。
+func wdSupportsMagicClose(fd int) bool {
+	info := watchdogInfo{}
+	// 注意：_IOR 的第三个参数是指针；这里用固定大小的 watchdog_info
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(wdIOCGetSupport), uintptr(unsafe.Pointer(&info)))
+	if errno != 0 {
+		return false
+	}
+	return info.Options&wdOptMagicClose != 0 || info.Options&wdOptNoWayOut != 0
 }
 
 // readKernelVersion 读取内核版本字符串
@@ -912,6 +996,15 @@ func readTotalMemoryMB() int64 {
 		}
 	}
 	return 0
+}
+
+// readBootID 读取 /proc/sys/kernel/random/boot_id，作为跨重启稳健判别依据。
+// 比 wall clock 更可靠：NAS 开机后 NTP 校时常跳变，纯时间比较会被打乱。
+func readBootID() string {
+	if b, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
+		return strings.TrimSpace(string(b))
+	}
+	return ""
 }
 
 // memUsage 返回 (已用百分比, 可用MB)，供状态页展示。
@@ -994,54 +1087,60 @@ func (d *daemon) writeTrend() {
 // ---- 状态 ----
 
 type status struct {
-	Running            bool   `json:"running"`
-	Enabled            bool   `json:"enabled"`
-	WatchdogOpen       bool   `json:"watchdog_open"`
-	WatchdogDevice     string `json:"watchdog_device"`
-	WatchdogIdentity   string `json:"watchdog_identity"`     // 硬件(iTCO_wdt) / 软件(softdog)
-	WatchdogTimeout    int    `json:"watchdog_timeout"`      // 驱动实际生效超时
-	WatchdogTimeoutCfg int    `json:"watchdog_timeout_cfg"`  // 用户配置的超时（对比实际值用）
-	Nowayout           bool   `json:"nowayout"`             // 看门狗 nowayout 状态（true=不可 magic close）
-	Version            string `json:"version"`
-	KernelVersion      string `json:"kernel_version"`        // 内核版本
-	CPUModel           string `json:"cpu_model"`             // CPU 型号
-	TotalMemoryMB      int64  `json:"total_memory_mb"`       // 物理内存总量 MB
-	Uptime             string `json:"uptime"`
-	CurrentLoad        string `json:"current_load"`
-	DStateCount        int    `json:"dstate_count"`
-	MemoryUsedPct      int    `json:"memory_used_pct"`
-	MemAvailableMB     int    `json:"mem_available_mb"`
-	TrendEnabled       bool   `json:"trend_enabled"`
-	LastRebootReason  string `json:"last_reboot_reason"`
-	ConsecutiveFails  int    `json:"consecutive_fails"`
-	Pid               int    `json:"pid"`
-	InBootGrace       bool   `json:"in_boot_grace"`          // 开机冷却期内
-	UpgradeBusy       string `json:"upgrade_busy"`           // 非空=维护窗口原因（升级/关机中）
-	BootReason        string `json:"boot_reason"`            // 本次开机自检结论（来源标注）
-	MaintainLeftMin   int    `json:"maintain_left_min"`      // 手动维护模式剩余分钟（0=无）
-	MaintainUntil     int64  `json:"maintain_until"`         // 手动维护模式截止 unix 秒（0=无；UI 倒计时用）
-	ProbeLearning     bool   `json:"probe_learning"`         // 探针处于学习期（未计入判定）
-	ProbeFailCount    int    `json:"probe_fail_count"`       // 探针连续失败次数（UI 学习期进度条用）
-	PortMigrateDetected string `json:"port_migrate_detected"` // 检测到端口迁移时的候选端口提示（空=无）
+	Running                 bool   `json:"running"`
+	Enabled                 bool   `json:"enabled"`
+	WatchdogOpen            bool   `json:"watchdog_open"`
+	WatchdogDevice          string `json:"watchdog_device"`
+	WatchdogIdentity        string `json:"watchdog_identity"`    // 硬件(iTCO_wdt) / 软件(softdog)
+	WatchdogTimeout         int    `json:"watchdog_timeout"`     // 驱动实际生效超时
+	WatchdogTimeoutCfg      int    `json:"watchdog_timeout_cfg"` // 用户配置的超时（对比实际值用）
+	Nowayout                bool   `json:"nowayout"`             // 看门狗 nowayout 状态（true=不可 magic close）
+	Version                 string `json:"version"`
+	KernelVersion           string `json:"kernel_version"`  // 内核版本
+	CPUModel                string `json:"cpu_model"`       // CPU 型号
+	TotalMemoryMB           int64  `json:"total_memory_mb"` // 物理内存总量 MB
+	Uptime                  string `json:"uptime"`
+	CurrentLoad             string `json:"current_load"`
+	DStateCount             int    `json:"dstate_count"`
+	MemoryUsedPct           int    `json:"memory_used_pct"`
+	MemAvailableMB          int    `json:"mem_available_mb"`
+	TrendEnabled            bool   `json:"trend_enabled"`
+	LastRebootReason        string `json:"last_reboot_reason"`
+	ConsecutiveFails        int    `json:"consecutive_fails"`
+	Pid                     int    `json:"pid"`
+	InBootGrace             bool   `json:"in_boot_grace"`              // 开机冷却期内
+	UpgradeBusy             string `json:"upgrade_busy"`               // 非空=维护窗口原因（升级/关机中）
+	BootReason              string `json:"boot_reason"`                // 本次开机自检结论（来源标注）
+	MaintainLeftMin         int    `json:"maintain_left_min"`          // 手动维护模式剩余分钟（0=无）
+	MaintainUntil           int64  `json:"maintain_until"`             // 手动维护模式截止 unix 秒（0=无；UI 倒计时用）
+	ProbeLearning           bool   `json:"probe_learning"`             // 探针处于学习期（未计入判定）
+	ProbeFailCount          int    `json:"probe_fail_count"`           // 探针连续失败次数（UI 学习期进度条用）
+	PortMigrateDetected     string `json:"port_migrate_detected"`      // 检测到端口迁移时的候选端口提示（空=无）
+	CheckServiceProbe       bool   `json:"check_service_probe"`        // 服务探针是否开启（v1.9.0：用于前端学习期横幅判断）
+	BootID                  string `json:"boot_id"`                    // 本次开机 boot_id（用于跨重启稳健判别，避免 NTP 校时导致的时间误判）
+	LastRebootReasonSummary string `json:"last_reboot_reason_summary"` // 重启原因摘要（仅首行），不随状态轮询下发整文件
 }
 
 // ---- 主守护进程 ----
 
 type daemon struct {
-	cfg               Config
-	mu                sync.Mutex
-	wd                *watchdog
-	wdTimeout         int  // 驱动实际生效的看门狗超时
-	monitoring        bool // 当前是否在喂狗（enabled 且已开狗）
-	failCount         int
-	lastReason        string
-	startTime         time.Time
-	cycle             int      // 健康检查周期计数，用于趋势日志
-	probeEverOK       bool     // 探针自本次进程启动以来是否成功过（学习期判定）
-	probeFailCount    int      // 探针连续失败次数（UI 学习期进度展示用）
-	wasBusy           bool     // 上一周期是否处于维护窗口（边沿检测用）
-	portWarned        bool     // 端口迁移警告是否已发出（避免重复告警）
-	portMigrateInfo   string   // 端口迁移检测到的候选端口信息（UI 展示用，空=无）
+	cfg             Config
+	mu              sync.Mutex
+	wd              *watchdog
+	wdTimeout       int  // 驱动实际生效的看门狗超时
+	wdMagicSafe     bool // 看门狗是否支持 magic close / nowayout（close 后仍能保持硬复位）
+	monitoring      bool // 当前是否允许喂狗（由独立 supervisor 读取；决定重启时置 false）
+	failCount       int
+	lastReason      string
+	startTime       time.Time
+	cycle           int       // 健康检查周期计数，用于趋势日志
+	probeEverOK     bool      // 探针自本次进程启动以来是否成功过（学习期判定）
+	probeLearnCount int       // 探针失败计入学习期的次数（达 probeLearnLimit 后退出学习期）
+	probeFailCount  int       // 探针连续失败次数（UI 学习期进度展示用）
+	wasBusy         bool      // 上一周期是否处于维护窗口（边沿检测用）
+	busySince       time.Time // 维护窗口连续开始的时刻（用于超时强制退出）
+	portWarned      bool      // 端口迁移警告是否已发出（避免重复告警）
+	portMigrateInfo string    // 端口迁移检测到的候选端口信息（UI 展示用，空=无）
 }
 
 // loadOrInitConfig 加载配置文件；若文件不存在则写入默认配置。
@@ -1095,13 +1194,37 @@ func loadOrInitConfig(cfg *Config) {
 	}
 }
 
+// atomicWrite 先写临时文件再 rename，避免掉电产生半截文件（配置/原因记录都走这里）
+func atomicWrite(path string, data []byte) error {
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// probeCmdRe 白名单：探针命令只允许是 curl 访问本机(127.0.0.1/localhost)固定端口，
+// 禁止任意 shell 命令，杜绝通过配置接口拿到 root 命令执行（P0 安全项）。
+// 关键：参数部分只允许 [A-Za-z0-9./_-]，绝不接受空格分隔的额外"命令"或 ; | & $ ` 等
+// shell 元字符，因此 "curl ... ; rm -rf /" 这类注入无法匹配而直接被拒。
+var probeCmdRe = regexp.MustCompile(`^curl\s+(-[A-Za-z]+(?:\s+[A-Za-z0-9./_-]+)?\s+)*https?://(127\.0\.0\.1|localhost):\d+/\s*$`)
+
+// validateProbeCmd 校验探针命令是否在白名单内；空字符串（未启用）始终允许。
+func validateProbeCmd(cmd string) bool {
+	if cmd == "" {
+		return true
+	}
+	return probeCmdRe.MatchString(cmd)
+}
+
 func saveConfig(cfg *Config) error {
 	_ = os.MkdirAll(cfg.etcDir(), 0o755)
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfg.configPath(), b, 0o644)
+	return atomicWrite(cfg.configPath(), b)
 }
 
 // systemSnapshot 收集重启前的系统快照，便于排查死机根因
@@ -1160,15 +1283,18 @@ func (d *daemon) ensureWatchdog() {
 			if err != nil {
 				logThrottled("wd-open-fail", "看门狗打开失败（将无法硬复位，稍后自动重试）: "+err.Error())
 				d.wd = nil
+				d.wdMagicSafe = false
 			} else {
 				d.wd = w
 				d.wdTimeout = actual
+				d.wdMagicSafe = wdSupportsMagicClose(w.fd)
 				id := readWatchdogIdentity()
 				kind := "软件看门狗(softdog)"
 				if !strings.Contains(id, "softdog") && id != "none" && id != "" {
 					kind = "硬件看门狗"
 				}
-				logf("看门狗已开启: %s identity=%s (%s, 驱动实际超时 %d 秒)", watchdogDevice, id, kind, actual)
+				logf("看门狗已开启: %s identity=%s (%s, 驱动实际超时 %d 秒, magic-close/nowayout=%v)",
+					w.device, id, kind, actual, d.wdMagicSafe)
 				if actual != d.cfg.WatchdogTimeoutSec {
 					logf("注意：驱动实际超时 %d 秒与配置 %d 秒不同（iTCO 等仅支持档位值），已按实际值工作", actual, d.cfg.WatchdogTimeoutSec)
 				}
@@ -1180,6 +1306,7 @@ func (d *daemon) ensureWatchdog() {
 			d.wd.disarm()
 			d.wd = nil
 		}
+		d.wdMagicSafe = false
 		d.monitoring = false
 	}
 }
@@ -1244,79 +1371,120 @@ func (d *daemon) triggerReboot(reason string) {
 
 	ts := time.Now().Format(time.RFC3339)
 
-	// v1.3.2：auto_reboot=false → 仅记录，不碰看门狗，不阻塞（用户意图：只观察）
-	if !d.cfg.AutoReboot {
+	// v1.3.2 + v1.9.0：auto_reboot=false → 仅记录，不碰看门狗，不阻塞（用户意图：只观察）。
+	// v1.9.0：在锁内读取 auto_reboot 配置值，修复并发读数据竞争（原代码在锁外读 d.cfg.AutoReboot）。
+	d.mu.Lock()
+	autoReboot := d.cfg.AutoReboot
+	d.mu.Unlock()
+	if !autoReboot {
 		logf("!!! 判定系统死机（auto_reboot=off，仅记录不重启）！！！")
 		logf("原因: %s", reason)
 		logf("若后续需要自动重启，请在页面开启 auto_reboot 或到参数配置勾选'判定死机后自动重启'")
-		// 第一段：落盘最小事实（不关闭看门狗）
-		minimal := ts + "\n" + reason + "\n\n(auto_reboot=off: 本次仅记录，未执行重启)\n"
-		_ = os.WriteFile(d.cfg.reasonPath(), []byte(minimal), 0o644)
+		_ = atomicWrite(d.cfg.reasonPath(), []byte(ts+"\n"+reason+"\n\n(auto_reboot=off: 本次仅记录，未执行重启)\n"))
 		return // ← 关键：返回主循环继续喂狗，绝不触发硬件复位
 	}
 
 	// === 决定重启的不可逆点：从此刻起彻底停止喂狗 ===
-	// v1.3.2：捕获所需配置值后再操作（防释放锁后的数据竞争）
+	// v1.9.0 硬件兜底可靠性修复（针对原"syscall.Close(fd) + 注释'硬件倒计时开始'"的致命缺陷）：
+	//   内核看门狗的"停喂即硬复位"对*所有*看门狗类型都成立——只要 fd 保持打开且不再喂狗，
+	//   计时器必然到期触发复位（与 magic close / nowayout 无关）。
+	//   而原逻辑中盲目 syscall.Close(fd)：在驱动既不支持 magic close 也未开 nowayout 时，
+	//   close 会直接 DISARM 看门狗，导致进程永久阻塞、系统却永不复位（比死机更糟）。
+	//   因此这里**绝不关闭 fd**，仅从 daemon 摘除引用并停止喂狗，由独立 supervisor 停止 petting，
+	//   硬件计时器照常到期复位。wdMagicSafe 仅用于状态展示，不再参与此决策。
 	d.mu.Lock()
 	wdTimeoutSec := d.cfg.WatchdogTimeoutSec
-	if d.wd != nil {
-		syscall.Close(d.wd.fd)
-		d.wd.fd = -1
-		d.wd = nil
-	}
-	d.monitoring = false
+	hadWd := d.wd != nil
+	d.wd = nil           // 摘除引用：supervisor 此后不再喂狗
+	d.monitoring = false // 停止喂狗的最终开关
 	d.mu.Unlock()
 
 	// 第一段：毫秒级落盘最小事实（防快照收集卡死丢证据）
 	minimal := ts + "\n" + reason + "\n\n(完整快照采集于判定时刻，若下方缺失说明系统在采集时已濒死)\n"
-	_ = os.WriteFile(d.cfg.reasonPath(), []byte(minimal), 0o644)
+	_ = atomicWrite(d.cfg.reasonPath(), []byte(minimal))
 	gLog.Write([]byte(fmt.Sprintf("[%s] !!! 判定系统死机，准备重启 !!!\n原因: %s\n", ts, reason)))
-	gLog.Write([]byte(fmt.Sprintf("[%s] 看门狗 fd 已关闭（不 magic close），硬件倒计时开始（约 %d 秒后硬复位）\n",
-		ts, wdTimeoutSec)))
+	if hadWd {
+		gLog.Write([]byte(fmt.Sprintf("[%s] 看门狗 fd 保持打开、停止喂狗：硬件计时器到期后硬复位（约 %d 秒，对所有看门狗类型均生效）\n", ts, wdTimeoutSec)))
+	} else {
+		gLog.Write([]byte(fmt.Sprintf("[%s] 无硬件看门狗：完全依赖下方 reboot/sysrq 强制重启链\n", ts)))
+	}
 
 	// 第二段：完整快照（可能较慢）追加落盘
 	snapshot := systemSnapshot()
 	if oom := readOOMLog(); oom != "" {
 		logf("快照含内核OOM证据（详见 oom_kernel_log）")
 	}
-	_ = os.WriteFile(d.cfg.reasonPath(), []byte(ts+"\n"+reason+"\n\n"+snapshot), 0o644)
+	_ = atomicWrite(d.cfg.reasonPath(), []byte(ts+"\n"+reason+"\n\n"+snapshot))
 	gLog.Write([]byte(fmt.Sprintf("[%s] 重启前快照已落盘:\n%s\n", ts, snapshot)))
 
-	// 尝试优雅重启（按优先级依次尝试）
+	// 强制重启链（依次尝试，越靠后越暴力，确保软件层优先于硬件硬复位）
+	attempted := []string{}
 	rebootOK := false
 	if err := syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART); err == nil {
-		logf("syscall.Reboot(LINUX_REBOOT_CMD_RESTART) 已发出")
 		rebootOK = true
 	} else {
-		logf("syscall.Reboot 失败(%v)，尝试 /sbin/reboot", err)
+		attempted = append(attempted, "syscall.Reboot")
 		if err := exec.Command("/sbin/reboot").Run(); err == nil {
-			logf("/sbin/reboot 已发出")
 			rebootOK = true
 		} else {
-			logf("/sbin/reboot 也失败(%v)", err)
+			attempted = append(attempted, "/sbin/reboot")
+			if err := exec.Command("/sbin/reboot", "-f").Run(); err == nil {
+				rebootOK = true
+			} else {
+				attempted = append(attempted, "/sbin/reboot -f")
+				if err := exec.Command("/bin/sh", "-c", "echo b > /proc/sysrq-trigger").Run(); err == nil {
+					rebootOK = true
+				} else {
+					attempted = append(attempted, "sysrq-trigger")
+				}
+			}
 		}
 	}
 
 	if rebootOK {
-		// 重启命令已发出；等待硬件看门狗兜底（若命令实际未生效）
-		gLog.Write([]byte(fmt.Sprintf("[%s] 等待系统重启...（若 %d 秒内未重启，硬件看门狗将硬复位）\n",
+		gLog.Write([]byte(fmt.Sprintf("[%s] 重启指令已发出，等待系统重启...（若 %d 秒内未重启，硬件看门狗将硬复位）\n",
 			time.Now().Format(time.RFC3339), wdTimeoutSec)))
 		time.Sleep(time.Duration(wdTimeoutSec+5) * time.Second)
-		// sleep 被唤醒（不应发生）：继续阻塞
-		gLog.Write([]byte(fmt.Sprintf("[%s] *** 异常：等待超时系统仍未重启 ***\n", time.Now().Format(time.RFC3339))))
-		select {}
+		gLog.Write([]byte(fmt.Sprintf("[%s] *** 异常：等待超时系统仍未重启，交由硬件看门狗 ***\n", time.Now().Format(time.RFC3339))))
 	}
 
-	// 所有重启方式均失败：记录严重错误并永久阻塞，等硬件看门狗兜底
-	gLog.Write([]byte(fmt.Sprintf("[%s] *** 致命：所有重启方式均失败，看门狗已关闭 %d 秒后硬复位 ***\n",
-		time.Now().Format(time.RFC3339), wdTimeoutSec)))
-	gLog.Write([]byte(fmt.Sprintf("[%s] 永久阻塞中（防止返回主循环恢复喂狗导致无法重启）\n", time.Now().Format(time.RFC3339))))
+	// 所有重启方式均失败：硬件看门狗（若已开启）计时器仍在走，必然硬复位；
+	// 若无硬件看门狗，则已尽力尝试 reboot/sysrq，只能永久阻塞（避免返回主循环恢复喂狗）。
+	gLog.Write([]byte(fmt.Sprintf("[%s] *** 致命：所有重启方式(%v)均失败；%s，永久阻塞中（防止返回主循环恢复喂狗导致无法重启）***\n",
+		time.Now().Format(time.RFC3339), attempted,
+		func() string {
+			if hadWd {
+				return "硬件看门狗已武装，约 " + strconv.Itoa(wdTimeoutSec) + " 秒后硬复位"
+			}
+			return "无硬件看门狗，无法自动硬复位"
+		}())))
 	select {} // 永久阻塞 —— 核心安全保证
 }
 
-// loop 主循环。判定与喂狗解耦：健康检查失败期间仍持续喂狗，
-// 只有真正决定重启时才停止喂狗 —— 单次抖动绝不启动硬件复位倒计时。
+// keysOf 返回 map 的 key 列表（用于日志展示检查族）
+func keysOf(m map[string]bool) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	return ks
+}
+
+// loop 主循环：负责"判定"逻辑（是否死机），喂狗由独立 supervisor 完成，二者解耦。
+// v1.9.0 关键设计：
+//   - 判定与喂狗彻底分离：即使本循环 panic 或卡死，supervisor 仍持续喂狗，绝不会饿死硬件看门狗。
+//   - 每项检查独立超时：某检查因系统"慢"而超时不算失败，按"弃权"处理，杜绝"慢被当失败"。
+//   - 法定人数规则：≥2 个独立检查族同时真正失败，才计入 failCount；单一检查失败或基础设施
+//     超时均不计数（宁可漏判也绝不单点/瞬时误杀，符合零误杀优先的核心原则）。
+//   - 维护窗口设连续占用上限：被常驻进程永久锁死时强制退出并告警，防止监控静默失效。
 func (d *daemon) loop() {
+	defer func() {
+		if r := recover(); r != nil {
+			logf("!!! loop 发生 panic（已捕获；看门狗由独立 supervisor 继续喂狗，不会被饿死）；5 秒后重启判定循环: %v", r)
+			time.Sleep(5 * time.Second)
+			go d.loop()
+		}
+	}()
 	for {
 		d.mu.Lock()
 		cfg := d.cfg
@@ -1342,7 +1510,6 @@ func (d *daemon) loop() {
 
 		// ① 开机冷却期：只喂狗不判定（开机 fsck/服务初始化期负载与 D 状态偏高，是误判高发期）
 		if uptimeMinutes() < float64(cfg.BootGraceMin) {
-			d.petWatchdog()
 			logThrottled("boot-grace", "开机冷却期内：只喂狗不判定（防开机初始化高负载误判）")
 			time.Sleep(time.Duration(cfg.IntervalSec) * time.Second)
 			continue
@@ -1350,7 +1517,6 @@ func (d *daemon) loop() {
 
 		// ② 手动维护模式：用户显式要求暂停判定（飞牛升级/手工维护的保底开关）
 		if d.inMaintainMode() {
-			d.petWatchdog()
 			logThrottled("maintain", "手动维护模式中：只喂狗不判定（到期自动恢复）")
 			time.Sleep(time.Duration(cfg.IntervalSec) * time.Second)
 			continue
@@ -1359,9 +1525,10 @@ func (d *daemon) loop() {
 		// ③ 自动维护窗口（系统升级/关机/重启进行中）：继续喂狗但绝不判定死机。
 		//    若窗口内系统真冻结，本进程随之冻结停止喂狗，硬件看门狗自然兜底。
 		if busy := systemBusyReason(); busy != "" {
-			d.petWatchdog()
-			logThrottled("busy", "维护窗口（"+busy+"）：继续喂狗，暂停死机判定")
 			d.mu.Lock()
+			if d.busySince.IsZero() {
+				d.busySince = time.Now()
+			}
 			wasBusy := d.wasBusy
 			d.wasBusy = true
 			d.mu.Unlock()
@@ -1371,13 +1538,30 @@ func (d *daemon) loop() {
 				d.failCount = 0
 				d.mu.Unlock()
 			}
-			time.Sleep(time.Duration(cfg.IntervalSec) * time.Second)
-			continue
+			// v1.9.0：维护窗口连续占用上限——防止被常驻进程（如 trim_* 升级守护）永久锁死，
+			// 导致监控静默失效（看门狗变装饰）。超过上限强制退出并告警。
+			d.mu.Lock()
+			since := d.busySince
+			d.mu.Unlock()
+			if time.Since(since) > maxBusyDuration {
+				logf("⚠️ 维护窗口已连续占用超过 %v（疑似常驻进程误锁死），强制退出维护状态并恢复死机判定！", maxBusyDuration)
+				d.mu.Lock()
+				d.busySince = time.Time{}
+				d.wasBusy = false
+				d.failCount = 0
+				d.mu.Unlock()
+				// 不 continue：落到下方正常检查逻辑
+			} else {
+				logThrottled("busy", "维护窗口（"+busy+"）：继续喂狗，暂停死机判定（已持续 "+since.Format("15:04:05")+"）")
+				time.Sleep(time.Duration(cfg.IntervalSec) * time.Second)
+				continue
+			}
 		}
 		// 维护窗口退出边沿：清零失败计数（窗口前积累的历史样本作废）
 		d.mu.Lock()
 		wasBusy := d.wasBusy
 		d.wasBusy = false
+		d.busySince = time.Time{}
 		d.mu.Unlock()
 		if wasBusy {
 			logf("维护窗口结束：恢复死机判定，历史失败计数已清零")
@@ -1386,66 +1570,95 @@ func (d *daemon) loop() {
 			d.mu.Unlock()
 		}
 
-		// ④ 健康检查（带整体超时，防止单次检查卡死导致喂狗中断）
-		cycleCtx, cancel := context.WithTimeout(context.Background(),
-			time.Duration(cfg.IntervalSec)*time.Second*4/5)
-		var results []checkResult
+		// ④ 健康检查：每项检查使用独立超时（= 一个完整周期），彼此不抢占预算。
+		//    检查并发执行（各自 goroutine + 独立 context 超时），整体循环周期 ≈ IntervalSec，
+		//    避免串行累计导致周期漂移（"3 分钟 = 18 周期"的判定窗口才准确）。
+		//    某检查因系统"慢"而超时 → 标记 Timeout，按"弃权"处理（不增不减 failCount），
+		//    绝不把"慢"误判为"失败"（核心原则：零误杀优先）。
+		cycleStart := time.Now()
+		results := make([]checkResult, 0, 6)
+		resCh := make(chan checkResult, 8)
+		launched := 0
+		runWithTimeout := func(fn func(context.Context) checkResult) {
+			launched++
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.IntervalSec)*time.Second)
+				defer cancel()
+				resCh <- fn(ctx)
+			}()
+		}
 		if cfg.CheckFork {
-			results = append(results, runFork(cycleCtx))
+			runWithTimeout(runFork)
 		}
 		if cfg.CheckLoad {
-			results = append(results, runLoad(cycleCtx, cfg.LoadThreshold))
+			runWithTimeout(func(ctx context.Context) checkResult { return runLoad(ctx, cfg.LoadThreshold) })
 		}
 		if cfg.CheckDState {
-			results = append(results, runDState(cycleCtx, cfg.DStateThreshold))
+			runWithTimeout(func(ctx context.Context) checkResult { return runDState(ctx, cfg.DStateThreshold) })
 		}
 		if cfg.CheckMemory {
-			results = append(results, runMemory(cycleCtx, cfg.MemAvailableThreshold))
+			runWithTimeout(func(ctx context.Context) checkResult { return runMemory(ctx, cfg.MemAvailableThreshold) })
 		}
 		if cfg.CheckServiceProbe {
-			results = append(results, runServiceProbe(cycleCtx, cfg.ServiceProbeCmd))
+			runWithTimeout(func(ctx context.Context) checkResult { return runServiceProbe(ctx, cfg.ServiceProbeCmd) })
 		}
-		cancel()
+		for i := 0; i < launched; i++ {
+			results = append(results, <-resCh)
+		}
 
-		allOK := true
-		var failed []string
+		// 收集"真正失败"（排除超时）；按检查族去重用于法定人数判定
+		genuineFamilies := map[string]bool{}
+		var genuineFailed, timedOut []string
+		for _, r := range results {
+			if r.Timeout {
+				timedOut = append(timedOut, r.Name+": "+r.Detail)
+			} else if !r.OK {
+				genuineFailed = append(genuineFailed, fmt.Sprintf("%s: %s", r.Name, r.Detail))
+				if r.Family != "" {
+					genuineFamilies[r.Family] = true
+				}
+			}
+		}
+
+		// 探针学习期（v1.9.0：固定前 N 次失败不计入判定，有退出条件，不再"永不成功就永久学习"）
+		d.mu.Lock()
+		probeOn := cfg.CheckServiceProbe && cfg.ServiceProbeCmd != ""
 		probeFailed := false
 		for _, r := range results {
-			if !r.OK {
-				allOK = false
-				if r.Name == "服务探针" {
-					probeFailed = true
-				}
-				failed = append(failed, fmt.Sprintf("%s: %s", r.Name, r.Detail))
+			if r.Name == "服务探针" && !r.OK && !r.Timeout {
+				probeFailed = true
 			}
 		}
-
-		// 探针学习期：探针开启但从未成功过 → 失败不计入判定（配置错误/服务未起防误杀）
-		d.mu.Lock()
-		if !probeFailed {
-			d.probeEverOK = true
-			d.probeFailCount = 0 // 探针成功：重置失败计数
-		} else {
-			d.probeFailCount++ // 探针失败：递增（UI 展示学习期进度）
+		if probeOn {
+			if probeFailed {
+				if d.probeLearnCount < probeLearnLimit {
+					d.probeLearnCount++
+				}
+				d.probeFailCount++
+			} else {
+				d.probeEverOK = true
+				d.probeFailCount = 0
+				d.probeLearnCount = 0
+			}
 		}
-		probeLearning := cfg.CheckServiceProbe && cfg.ServiceProbeCmd != "" && !d.probeEverOK
+		learningActive := probeOn && d.probeLearnCount < probeLearnLimit
 		d.mu.Unlock()
-		if probeLearning && probeFailed && len(failed) > 0 {
-			// 剔除探针失败项，仅当其余检查全通过时不计数
-			othersOK := true
-			for _, r := range results {
-				if !r.OK && r.Name != "服务探针" {
-					othersOK = false
+
+		// 学习期内：把探针从"真正失败"集合里剔除，避免配置错误/服务慢启动误杀
+		if learningActive && probeFailed {
+			delete(genuineFamilies, "web")
+			kept := genuineFailed[:0]
+			for _, f := range genuineFailed {
+				if !strings.HasPrefix(f, "服务探针") {
+					kept = append(kept, f)
 				}
 			}
-			if othersOK {
-				allOK = true
-				logThrottled("probe-learn", "探针尚未成功过（学习期）：失败暂不计入判定，请核对探针命令与端口（新版飞牛默认 5666，非 80）")
-			}
+			genuineFailed = kept
+			logThrottled("probe-learn", "探针处于学习期（前 "+strconv.Itoa(probeLearnLimit)+" 次失败不计入判定）：失败暂不计入，请核对探针命令与端口（新版飞牛默认 5666，非 80）")
 		}
 
-		// 端口迁移检测（v1.3.0 防误报）：探针失败次数过半时，检查飞牛管理端口是否变了
-		if probeFailed && !probeLearning {
+		// 端口迁移检测（v1.9.0：解除对"学习期"的耦合，探针失败即检测，防配置错误静默废掉探针）
+		if probeFailed {
 			d.mu.Lock()
 			fc := d.failCount + 1
 			warned := d.portWarned
@@ -1453,7 +1666,7 @@ func (d *daemon) loop() {
 			if fc >= cfg.FailThreshold/2 && fc < cfg.FailThreshold && !warned {
 				if port := probeCandidatePorts(); port > 0 {
 					msg := fmt.Sprintf("探针端口无响应但 %d 端口有 Web 响应，可能端口已变更", port)
-					logf("⚠️ 疑似飞牛管理端口已迁移：%s。请到页面更新探针命令。本次失败计数清零（防误报）", msg)
+					logf("⚠️ 疑似飞牛管理端口已迁移：%s。请到页面更新探针命令。本次不计入（防误报）", msg)
 					d.mu.Lock()
 					d.portWarned = true
 					d.portMigrateInfo = msg
@@ -1463,33 +1676,86 @@ func (d *daemon) loop() {
 			}
 		}
 
+		// ⑤ 判定：法定人数规则（v1.9.0）
+		//    - ≥2 个独立检查族同时真正失败 → 计入一个失败周期（failCount++）
+		//    - 仅 1 族失败或全过 → 不计为失败（清零），宁可漏判也不单点误杀
+		//    - 全部超时（无真正失败）→ 弃权：failCount 不变（系统只是慢）
 		d.mu.Lock()
-		if allOK {
-			d.failCount = 0
-			d.portWarned = false // 状态恢复后重置端口迁移警告
-			d.portMigrateInfo = "" // 状态恢复后清除端口迁移提示
-		} else {
-			d.failCount++
-		}
 		fc := d.failCount
+		switch {
+		case len(genuineFamilies) >= 2:
+			fc++
+			d.portWarned = false
+			d.portMigrateInfo = ""
+		case len(genuineFailed) == 0:
+			if len(timedOut) == 0 {
+				fc = 0 // 全过 → 清零
+			}
+			// 全超时 → 弃权，failCount 保持不变
+		default:
+			fc = 0 // 仅 1 族真正失败（不足法定人数）→ 清零
+		}
+		d.failCount = fc
+		fcSnapshot := fc
 		d.mu.Unlock()
 
-		if allOK {
-			d.petWatchdog()
-		} else {
-			reason := strings.Join(failed, " | ")
-			logf("健康检查失败(%d/%d): %s", fc, cfg.FailThreshold, reason)
-			// 关键：失败期间仍继续喂狗。只有达到阈值决定重启才停喂（见 triggerReboot）。
-			d.petWatchdog()
-			if fc >= cfg.FailThreshold {
-				d.triggerReboot(reason)
-				d.mu.Lock()
-				d.failCount = 0
-				d.mu.Unlock()
+		if len(genuineFailed) > 0 || len(timedOut) > 0 {
+			switch {
+			case len(genuineFamilies) >= 2:
+				logf("健康检查失败(%d/%d)，命中法定人数%v: %s", fcSnapshot, cfg.FailThreshold, keysOf(genuineFamilies), strings.Join(genuineFailed, " | "))
+			case len(timedOut) > 0:
+				logThrottled("slow", "部分检查超时（系统偏慢，按弃权处理，不计数）: "+strings.Join(timedOut, " | "))
+			default:
+				logThrottled("single-fail", "仅单族检查失败（不足法定人数，不计数，防单点误杀）: "+strings.Join(genuineFailed, " | "))
 			}
 		}
 
-		time.Sleep(time.Duration(cfg.IntervalSec) * time.Second)
+		if fcSnapshot >= cfg.FailThreshold {
+			reason := strings.Join(genuineFailed, " | ")
+			if reason == "" {
+				reason = "多个独立检查族持续异常（详见日志）"
+			}
+			d.triggerReboot(reason)
+			d.mu.Lock()
+			d.failCount = 0
+			d.mu.Unlock()
+		}
+
+		// 维持稳定周期：扣除本次判定已用时间，补足剩余 IntervalSec（避免周期漂移）
+		if remain := time.Duration(cfg.IntervalSec)*time.Second - time.Since(cycleStart); remain > 0 {
+			time.Sleep(remain)
+		}
+	}
+}
+
+// supervisor 独立喂狗协程：只负责"喂狗"这一件事，与判定循环（loop）完全解耦。
+// 这样即使 loop panic/卡死或 UI/HTTP 层崩溃，喂狗也不会中断——绝不饿死硬件看门狗。
+// v1.9.0 新增：把"最小喂狗进程"从业务循环里拆出来，是看门狗可靠性的底线保障。
+func (d *daemon) supervisor() {
+	defer func() {
+		if r := recover(); r != nil {
+			logf("!!! supervisor panic（已捕获，5 秒后重启喂狗协程）: %v", r)
+			time.Sleep(5 * time.Second)
+			go d.supervisor()
+		}
+	}()
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	rot := time.NewTicker(time.Minute)
+	defer rot.Stop()
+	for {
+		select {
+		case <-tick.C:
+			d.mu.Lock()
+			feed := d.monitoring && d.wd != nil
+			w := d.wd
+			d.mu.Unlock()
+			if feed && w != nil {
+				_ = w.pet()
+			}
+		case <-rot.C:
+			gLog.Rotate()
+		}
 	}
 }
 
@@ -1526,6 +1792,8 @@ func (d *daemon) readBootReasonSummary() string {
 }
 
 func (d *daemon) buildStatus() status {
+	// v1.9.0：修复数据竞争——在锁内一次性取出所有需要的配置/状态快照，
+	// 锁外不再触碰 d.cfg / d.portMigrateInfo 等共享字段（原代码在 Unlock 后多处读 d.cfg）。
 	d.mu.Lock()
 	enabled := d.cfg.Enabled
 	wd := d.wd
@@ -1533,12 +1801,20 @@ func (d *daemon) buildStatus() status {
 	bootGrace := d.cfg.BootGraceMin
 	maintainUntil := d.cfg.MaintainUntil
 	wdTimeout := d.wdTimeout
+	watchdogTimeoutCfg := d.cfg.WatchdogTimeoutSec
+	trendInterval := d.cfg.TrendInterval
 	probeEverOK := d.probeEverOK
 	probeOn := d.cfg.CheckServiceProbe && d.cfg.ServiceProbeCmd != ""
+	portMigrateInfo := d.portMigrateInfo
+	checkServiceProbe := d.cfg.CheckServiceProbe
 	d.mu.Unlock()
 	reason := ""
 	if b, err := os.ReadFile(d.cfg.reasonPath()); err == nil {
 		reason = strings.TrimSpace(string(b))
+	}
+	reasonSummary := reason
+	if idx := strings.Index(reason, "\n"); idx >= 0 {
+		reasonSummary = reason[:idx]
 	}
 	id := readWatchdogIdentity()
 	usedPct, availMB := memUsage()
@@ -1550,39 +1826,80 @@ func (d *daemon) buildStatus() status {
 	}
 	timeoutShown := wdTimeout
 	if timeoutShown == 0 {
-		timeoutShown = d.cfg.WatchdogTimeoutSec
+		timeoutShown = watchdogTimeoutCfg
 	}
 	return status{
-		Running:              true,
-		Enabled:              enabled,
-		WatchdogOpen:         wd != nil,
-		WatchdogDevice:       watchdogDevice,
-		WatchdogIdentity:     id,
-		WatchdogTimeout:      timeoutShown,
-		WatchdogTimeoutCfg:   d.cfg.WatchdogTimeoutSec,
-		Nowayout:             readNowayout(),
-		Version:              appVersion,
-		KernelVersion:        readKernelVersion(),
-		CPUModel:             readCPUModel(),
-		TotalMemoryMB:        readTotalMemoryMB(),
-		Uptime:               readUptime(),
-		CurrentLoad:          d.currentLoad(),
-		DStateCount:          d.dstateCount(),
-		MemoryUsedPct:        usedPct,
-		MemAvailableMB:       availMB,
-		TrendEnabled:         d.cfg.TrendInterval > 0,
-		LastRebootReason:     reason,
-		ConsecutiveFails:     fails,
-		Pid:                  os.Getpid(),
-		InBootGrace:          upMin < float64(bootGrace),
-		UpgradeBusy:          busy,
-		BootReason:           d.readBootReasonSummary(),
-		MaintainLeftMin:      maintainLeft,
-		MaintainUntil:        maintainUntil,
-		ProbeLearning:        probeOn && !probeEverOK,
-		ProbeFailCount:       d.probeFailCount,
-		PortMigrateDetected:  d.portMigrateInfo,
+		Running:      true,
+		Enabled:      enabled,
+		WatchdogOpen: wd != nil,
+		WatchdogDevice: func() string {
+			if wd != nil && wd.device != "" {
+				return wd.device
+			}
+			return strings.Join(watchdogDevices, ", ")
+		}(),
+		WatchdogIdentity:        id,
+		WatchdogTimeout:         timeoutShown,
+		WatchdogTimeoutCfg:      watchdogTimeoutCfg,
+		Nowayout:                readNowayout(),
+		Version:                 appVersion,
+		KernelVersion:           readKernelVersion(),
+		CPUModel:                readCPUModel(),
+		TotalMemoryMB:           readTotalMemoryMB(),
+		Uptime:                  readUptime(),
+		CurrentLoad:             d.currentLoad(),
+		DStateCount:             d.dstateCount(),
+		MemoryUsedPct:           usedPct,
+		MemAvailableMB:          availMB,
+		TrendEnabled:            trendInterval > 0,
+		LastRebootReason:        reasonSummary,
+		LastRebootReasonSummary: reasonSummary,
+		ConsecutiveFails:        fails,
+		Pid:                     os.Getpid(),
+		InBootGrace:             upMin < float64(bootGrace),
+		UpgradeBusy:             busy,
+		BootReason:              d.readBootReasonSummary(),
+		MaintainLeftMin:         maintainLeft,
+		MaintainUntil:           maintainUntil,
+		ProbeLearning:           probeOn && !probeEverOK,
+		ProbeFailCount:          d.probeFailCount,
+		PortMigrateDetected:     portMigrateInfo,
+		CheckServiceProbe:       checkServiceProbe,
+		BootID:                  readBootID(),
 	}
+}
+
+// sameOrigin 校验写操作的跨站安全（P0 安全项）：
+// 同源请求（fnOS 网关 / 反代均同源）要么不带 Origin 头，要么 Origin 主机名与本机一致；
+// 跨站请求（攻击者页面诱导浏览器发起的"简单请求"，如 <form enctype=text/plain>）会带不同
+// Origin → 直接拒绝。这样即便 8900 端口可被局域网访问，也无法被 CSRF 利用。
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // 同源导航/简单请求常不带 Origin
+	}
+	ou, err := url.Parse(origin)
+	if err != nil || ou.Host == "" {
+		return false
+	}
+	rh := r.Host
+	if h, _, e := net.SplitHostPort(r.Host); e == nil {
+		rh = h
+	}
+	oh := ou.Host
+	if h, _, e := net.SplitHostPort(ou.Host); e == nil {
+		oh = h
+	}
+	return strings.EqualFold(rh, oh)
+}
+
+// requireSafeWrite 校验写操作的同源与 Content-Type，失败直接 403/415。
+func (d *daemon) requireSafeWrite(w http.ResponseWriter, r *http.Request) bool {
+	if !sameOrigin(r) {
+		http.Error(w, "forbidden: cross-origin write rejected", http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 func (d *daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -1603,6 +1920,15 @@ func (d *daemon) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 func (d *daemon) handleConfigSet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
+		return
+	}
+	// P0 安全：同源校验 + 必须 JSON（拒绝 <form enctype=text/plain> 类 CSRF 简单请求）
+	if !d.requireSafeWrite(w, r) {
+		return
+	}
+	ct := r.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/json") {
+		http.Error(w, "unsupported content-type (require application/json)", http.StatusUnsupportedMediaType)
 		return
 	}
 	body, err := io.ReadAll(r.Body)
@@ -1636,24 +1962,79 @@ func (d *daemon) handleConfigSet(w http.ResponseWriter, r *http.Request) {
 	}
 	// v1.3.1：配置值合法性校验（防零值/极端值导致立即误判或永远不判定）
 	validated := false
-	if newCfg.IntervalSec < 2 { newCfg.IntervalSec = 2; validated = true }
-	if newCfg.IntervalSec > 300 { newCfg.IntervalSec = 300; validated = true }
-	if newCfg.WatchdogTimeoutSec < 5 { newCfg.WatchdogTimeoutSec = 5; validated = true }
-	if newCfg.WatchdogTimeoutSec > 600 { newCfg.WatchdogTimeoutSec = 600; validated = true }
-	if newCfg.FailThreshold < 1 { newCfg.FailThreshold = 1; validated = true }
-	if newCfg.FailThreshold > 120 { newCfg.FailThreshold = 120; validated = true }
-	if newCfg.BootGraceMin < 0 { newCfg.BootGraceMin = 0; validated = true }
-	if newCfg.BootGraceMin > 60 { newCfg.BootGraceMin = 60; validated = true }
-	if newCfg.LoadThreshold < 0 { newCfg.LoadThreshold = 0; validated = true }
-	if newCfg.DStateThreshold < 0 { newCfg.DStateThreshold = 0; validated = true }
-	if newCfg.DStateThreshold > 500 { newCfg.DStateThreshold = 500; validated = true }
-	if newCfg.MemAvailableThreshold < 1 { newCfg.MemAvailableThreshold = 1; validated = true }
-	if newCfg.MemAvailableThreshold > 100 { newCfg.MemAvailableThreshold = 100; validated = true }
-	if newCfg.TrendInterval < 0 { newCfg.TrendInterval = 0; validated = true }
-	if newCfg.TrendInterval > 200 { newCfg.TrendInterval = 200; validated = true }
-	if newCfg.Port < 1 || newCfg.Port > 65535 { newCfg.Port = defaultPort; validated = true }
+	if newCfg.IntervalSec < 2 {
+		newCfg.IntervalSec = 2
+		validated = true
+	}
+	if newCfg.IntervalSec > 300 {
+		newCfg.IntervalSec = 300
+		validated = true
+	}
+	if newCfg.WatchdogTimeoutSec < 5 {
+		newCfg.WatchdogTimeoutSec = 5
+		validated = true
+	}
+	if newCfg.WatchdogTimeoutSec > 600 {
+		newCfg.WatchdogTimeoutSec = 600
+		validated = true
+	}
+	if newCfg.FailThreshold < 1 {
+		newCfg.FailThreshold = 1
+		validated = true
+	}
+	if newCfg.FailThreshold > 120 {
+		newCfg.FailThreshold = 120
+		validated = true
+	}
+	if newCfg.BootGraceMin < 0 {
+		newCfg.BootGraceMin = 0
+		validated = true
+	}
+	if newCfg.BootGraceMin > 60 {
+		newCfg.BootGraceMin = 60
+		validated = true
+	}
+	if newCfg.LoadThreshold < 0 {
+		newCfg.LoadThreshold = 0
+		validated = true
+	}
+	if newCfg.DStateThreshold < 0 {
+		newCfg.DStateThreshold = 0
+		validated = true
+	}
+	if newCfg.DStateThreshold > 500 {
+		newCfg.DStateThreshold = 500
+		validated = true
+	}
+	if newCfg.MemAvailableThreshold < 1 {
+		newCfg.MemAvailableThreshold = 1
+		validated = true
+	}
+	if newCfg.MemAvailableThreshold > 100 {
+		newCfg.MemAvailableThreshold = 100
+		validated = true
+	}
+	if newCfg.TrendInterval < 0 {
+		newCfg.TrendInterval = 0
+		validated = true
+	}
+	if newCfg.TrendInterval > 200 {
+		newCfg.TrendInterval = 200
+		validated = true
+	}
+	if newCfg.Port < 1 || newCfg.Port > 65535 {
+		newCfg.Port = defaultPort
+		validated = true
+	}
 	if validated {
 		logf("配置校验：部分值被修正到合法范围（详见日志/当前配置）")
+	}
+	// 探针命令白名单校验（P0 安全）：只允许 curl 探测本机(127.0.0.1/localhost)端口，
+	// 杜绝通过配置接口获得任意 root shell 命令执行（原实现对所有命令照单全收）。
+	if !validateProbeCmd(newCfg.ServiceProbeCmd) {
+		d.mu.Unlock()
+		http.Error(w, "invalid service_probe_cmd: 只允许 curl 探测本机(127.0.0.1)端口，禁止任意命令", http.StatusBadRequest)
+		return
 	}
 	// 探针命令变更后重新进入学习期（新命令从未验证过）
 	if newCfg.ServiceProbeCmd != d.cfg.ServiceProbeCmd {
@@ -1690,6 +2071,9 @@ func (d *daemon) handleToggle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	if !d.requireSafeWrite(w, r) {
+		return
+	}
 	enable := r.URL.Query().Get("enabled") == "1"
 	d.mu.Lock()
 	d.cfg.Enabled = enable
@@ -1711,6 +2095,9 @@ func (d *daemon) handleToggle(w http.ResponseWriter, r *http.Request) {
 func (d *daemon) handleMaintain(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if !d.requireSafeWrite(w, r) {
 		return
 	}
 	q := r.URL.Query()
@@ -1752,24 +2139,115 @@ func (d *daemon) handleMaintain(w http.ResponseWriter, r *http.Request) {
 		"state": fmt.Sprintf("维护模式已开启：%d 分钟内不判定死机（继续喂狗）", minutes)})
 }
 
+// handlePurgeData v1.5.0：创建"卸载时清理数据"标记文件（辅助功能）。
+// ⚠️ v1.6.0 起，主要卸载数据删除机制已改为官方 wizard/uninstall 表单（uninstall_purge_data 字段）。
+// 本 API 保留作为运行时便利功能：用户可在不卸载的情况下预标记清理。
+func (d *daemon) handlePurgeData(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if !d.requireSafeWrite(w, r) {
+		return
+	}
+	marker := filepath.Join(d.cfg.varDir(), ".purge_on_uninstall")
+	if err := os.WriteFile(marker, []byte(fmt.Sprintf("created: %s\n", time.Now().Format(time.RFC3339))), 0o644); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(500)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "写入标记文件失败: " + err.Error()})
+		return
+	}
+	logf("用户已标记：卸载时彻底清理应用数据（标记文件: %s）", marker)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"result": "ok",
+		"msg":    "已标记：下次卸载应用时将自动删除所有数据（日志/配置/重启原因）。如需取消，使用「取消数据清理」按钮。",
+	})
+}
+
+// handleClearData v1.5.0：立即清除应用数据（日志、重启原因、趋势等），
+// 但**保留配置文件 config.json**（用户可能还要用）。
+// 需要二次确认参数 ?confirm=1 防止误操作。
+func (d *daemon) handleClearData(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if !d.requireSafeWrite(w, r) {
+		return
+	}
+	// 二次确认：必须带 confirm=1
+	if r.URL.Query().Get("confirm") != "1" {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"need_confirm": true,
+			"msg":          "⚠️ 此操作将立即删除所有运行日志、重启原因记录和趋势数据！如确认，请再次点击（会弹出最终确认）。",
+			"data_size":    dataSize(d.cfg.varDir()),
+		})
+		return
+	}
+
+	varDir := d.cfg.varDir()
+	removed := []string{}
+	failed := []string{}
+
+	// 删除数据目录下的文件（保留目录本身）
+	for _, f := range []string{"kanmendog.log", "last_reboot_reason", "boot_reason", "trend.csv", ".purge_on_uninstall"} {
+		path := filepath.Join(varDir, f)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			failed = append(failed, f)
+		} else if err == nil {
+			removed = append(removed, f)
+		}
+	}
+
+	logf("用户手动清除应用数据：已删除 %v，失败 %v", removed, failed)
+
+	w.Header().Set("Content-Type", "application/json")
+	resp := map[string]interface{}{"result": "ok", "removed": removed}
+	if len(failed) > 0 {
+		resp["failed"] = failed
+		resp["msg"] = fmt.Sprintf("已删除 %d 项，%d 项失败（可能需要手动删除）", len(removed), len(failed))
+	} else {
+		resp["msg"] = fmt.Sprintf("已成功清除 %d 项数据（配置文件已保留）", len(removed))
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// dataSize 返回目录的磁盘占用（人类可读格式）
+func dataSize(dir string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "du", "-sh", dir).Output()
+	if err != nil {
+		return "未知"
+	}
+	return strings.Fields(string(out))[0]
+}
+
 // handleService 控制 systemd 服务（真实启停整个进程）
 // handleHealth 健康检查端点（v1.4.0）：用于诊断 API 是否正常工作，
 // 以及确认配置加载、看门狗状态、环境变量等关键信息。
 func (d *daemon) handleHealth(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	health := map[string]interface{}{
-		"status":    "ok",
-		"version":   appVersion,
-		"pid":       os.Getpid(),
-		"uptime_sec": int(time.Since(d.startTime).Seconds()),
-		"config_path": d.cfg.configPath(),
+		"status":        "ok",
+		"version":       appVersion,
+		"pid":           os.Getpid(),
+		"uptime_sec":    int(time.Since(d.startTime).Seconds()),
+		"config_path":   d.cfg.configPath(),
 		"config_exists": false,
-		"log_path":   d.cfg.logPath(),
-		"log_exists": false,
+		"log_path":      d.cfg.logPath(),
+		"log_exists":    false,
 		"watchdog_open": d.wd != nil,
-		"watchdog_device": watchdogDevice,
-		"env_trim_pkgetc": os.Getenv("TRIM_PKGETC"),
-		"env_trim_pkgvar": os.Getenv("TRIM_PKGVAR"),
+		"watchdog_device": func() string {
+			if d.wd != nil && d.wd.device != "" {
+				return d.wd.device
+			}
+			return strings.Join(watchdogDevices, ", ")
+		}(),
+		"env_trim_pkgetc":  os.Getenv("TRIM_PKGETC"),
+		"env_trim_pkgvar":  os.Getenv("TRIM_PKGVAR"),
 		"env_trim_appdest": os.Getenv("TRIM_APPDEST"),
 	}
 	if _, err := os.Stat(d.cfg.configPath()); err == nil {
@@ -1793,10 +2271,14 @@ func (d *daemon) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleService 服务控制（start/stop/restart）。
 // v1.4.0：兼容飞牛环境 —— 检测 systemctl 可用性，不可用时提供明确错误信息；
-//   同时支持直接信号控制（非 systemd 环境下的降级方案）。
+//
+//	同时支持直接信号控制（非 systemd 环境下的降级方案）。
 func (d *daemon) handleService(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if !d.requireSafeWrite(w, r) {
 		return
 	}
 	action := r.URL.Query().Get("action")
@@ -1826,11 +2308,9 @@ func (d *daemon) handleService(w http.ResponseWriter, r *http.Request) {
 		case "stop":
 			result["output"] = "systemctl 不可用，发送 SIGTERM 请求进程退出"
 			result["warn"] = "当前环境无 systemctl；已发送停止信号。若通过飞牛应用中心安装，请使用应用中心的启动/停止按钮控制服务。"
-			// 尝试发信号给自己（优雅退出会 disarm 看门狗）
-			if pid, err := strconv.Atoi(os.Getenv("KANMENDOG_PID")); err == nil {
-				_ = syscall.Kill(pid, syscall.SIGTERM)
-				result["output"] = fmt.Sprintf("已向 PID %d 发送 SIGTERM", pid)
-			}
+			// 向自身发送 SIGTERM（优雅退出会 disarm 看门狗）
+			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+			result["output"] = fmt.Sprintf("已向 PID %d 发送 SIGTERM", os.Getpid())
 		case "restart":
 			result["output"] = "systemctl 不可用，无法重启"
 			result["warn"] = "当前环境无 systemctl；无法通过页面重启。请使用飞牛应用中心的重启按钮。"
@@ -1873,14 +2353,79 @@ func (d *daemon) startHTTP() {
 	mux.HandleFunc("/api/maintain", d.handleMaintain)
 	mux.HandleFunc("/api/service", d.handleService)
 	mux.HandleFunc("/api/health", d.handleHealth)
+	mux.HandleFunc("/api/purge-data", d.handlePurgeData) // v1.5.0: 标记卸载时清理数据
+	mux.HandleFunc("/api/clear-data", d.handleClearData) // v1.5.0: 立即清除应用数据
+
+	// 反代/网关兼容：兼容三种访问方式，后端统一归一化到根路径后再交给 mux：
+	//   1. 直接访问（无前缀）：/api/status、/
+	//   2. fnOS 桌面网关：/apps/{appname}/main/api/status、/apps/{appname}/main/
+	//   3. 任意域名反代子路径（nginx/隧道等「未 strip 前缀」配置）：
+	//      /mypath/api/status、/mypath/ —— 把首个 /api/ 之前整段当作反代前缀剥离
+	// 关键：无论反代是否 strip 前缀，前端都用 location.pathname 算出子路径作为 API 前缀，
+	//      后端同时兼容 strip（收到干净 /api/...）与未 strip（收到 /子路径/api/...）两种转发。
+	gatewayPrefix := fmt.Sprintf("/apps/%s/main", appName)
+	normalizePath := func(raw string) string {
+		if strings.HasPrefix(raw, gatewayPrefix) {
+			raw = strings.TrimPrefix(raw, gatewayPrefix)
+			if raw == "" {
+				raw = "/"
+			}
+			return raw
+		}
+		// 反代未 strip 前缀：/子路径/api/status → /api/status（idx>=0 含根访问 /api/... 的情况）
+		if idx := strings.Index(raw, "/api/"); idx >= 0 {
+			return raw[idx:]
+		}
+		// 其余（含 / 与任意未识别子路径根访问）一律交给 "/" 路由返回 index.html
+		return "/"
+	}
+	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// favicon 直接 204，避免被归一化为 "/" 后回吐 index.html 污染日志
+		if r.URL.Path == "/favicon.ico" || strings.HasSuffix(r.URL.Path, "/favicon.ico") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		r.URL.Path = normalizePath(r.URL.Path)
+		mux.ServeHTTP(w, r)
+	})
 
 	d.mu.Lock()
 	port := d.cfg.Port
 	d.mu.Unlock()
-	addr := fmt.Sprintf(":%d", port)
-	logf("Web 服务启动于 %s", addr)
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	if err := srv.ListenAndServe(); err != nil {
+	// P0 安全（v1.9.0）：默认只绑 127.0.0.1。fnOS 网关与用户反代都在本机转发到 127.0.0.1:port，
+	// 因此远程访问不受影响；但局域网内裸 IP:8900 不再可被任意设备访问，杜绝未授权读写。
+	// 仅当用户确需"直连非本机访问"时，设置环境变量 KANMENDOG_BIND_ADDR=0.0.0.0 放开。
+	bindHost := envOr("KANMENDOG_BIND_ADDR", "127.0.0.1")
+	if bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
+	addr := net.JoinHostPort(bindHost, strconv.Itoa(port))
+	logf("Web 服务启动于 %s（网关前缀 %s，已兼容域名反代子路径；绑定仅本机 127.0.0.1，如需局域网直连设 KANMENDOG_BIND_ADDR=0.0.0.0）", addr, gatewayPrefix)
+
+	// 端口监听失败重试；仍失败则解除看门狗并阻塞，避免在 nowayout 机器上陷入"硬复位循环"。
+	var ln net.Listener
+	var err error
+	for i := 0; i < 5; i++ {
+		ln, err = net.Listen("tcp", addr)
+		if err == nil {
+			break
+		}
+		logf("HTTP 端口 %s 监听失败（第 %d 次重试）: %v", addr, i+1, err)
+		time.Sleep(time.Second)
+	}
+	if err != nil {
+		logf("!!! HTTP 端口 %s 持续无法监听：已解除看门狗并阻塞进程，避免 nowayout 机器陷入硬复位循环（请通过 fnOS 应用中心重启服务或检查端口占用）", addr)
+		d.mu.Lock()
+		if d.wd != nil {
+			d.wd.disarm()
+			d.wd = nil
+		}
+		d.monitoring = false
+		d.mu.Unlock()
+		select {}
+	}
+	srv := &http.Server{Handler: root, ReadHeaderTimeout: 10 * time.Second}
+	if err := srv.Serve(ln); err != nil {
 		logf("HTTP 服务错误: %v", err)
 	}
 }
@@ -1952,16 +2497,22 @@ func main() {
 	// 这里必须在退出前 magic close 解除看门狗。
 	// 注意：真死机时本进程与 systemd 一并被冻结，本 handler 不会执行，
 	// fd 保持打开且停止喂狗，硬件看门狗照常兜底复位 —— 两不冲突。
+	// v1.9.0：signal 处理 goroutine 加 recover()，防止 panic 导致进程退出后看门狗被饿死。
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logf("!!! signal goroutine panic（已捕获）: %v", r)
+			}
+		}()
 		for sig := range sigCh {
 			d.gracefulShutdown(sig)
 		}
 	}()
 
-	// 记录 PID 到环境变量供服务控制降级使用
-	_ = os.Setenv("KANMENDOG_PID", strconv.Itoa(os.Getpid()))
+	// v1.9.0：独立喂狗 supervisor——与判定循环解耦，任何业务层 panic 都不会饿死硬件看门狗
+	go d.supervisor()
 
 	go d.loop()
 	d.startHTTP()

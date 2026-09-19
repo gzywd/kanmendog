@@ -95,7 +95,7 @@
         <span class="slider"></span>
       </label>
       <span id="enabledTxt" class="muted"></span>
-      <button class="ghost" onclick="refresh()">刷新状态</button>
+      <button class="ghost" onclick="refreshStatus()">刷新状态</button>
     </div>
     <!-- 手动维护模式 -->
     <div class="maint-bar" id="maintBar" style="display:none">
@@ -138,6 +138,12 @@
         <option value="8001">8001（旧版 HTTPS）</option>
         <option value="80">80（HTTP 重定向）</option>
         <option value="443">443（HTTPS）</option>
+        <option value="__custom__">📝 自定义端口...</option>
+      </select>
+      <input type="number" id="probe_custom_port" min="1" max="65535" placeholder="如 16666" style="width:100px;display:none;background:#0f1420;border:1px solid #2c3650;color:var(--fg);border-radius:7px;padding:6px 9px;">
+      <select id="probe_custom_scheme" style="display:none;background:#0f1420;border:1px solid #2c3650;color:var(--fg);border-radius:7px;padding:6px 9px;">
+        <option value="http">HTTP</option>
+        <option value="https">HTTPS</option>
       </select>
       <span class="muted" id="probeSchemeHint" style="margin-left:8px"></span>
     </label>
@@ -170,6 +176,21 @@
 
 <script>
 const $ = id => document.getElementById(id);
+
+// 反代/网关兼容：根据当前页面真实路径算出 API 前缀，兼容三种访问方式：
+//   1. 直接访问（无子路径）：location.pathname = "/" → 前缀为 ""
+//   2. fnOS 桌面网关：/apps/{appname}/{entry}/ → 前缀为该网关路径
+//   3. 任意域名反代子路径（nginx/隧道等）：/mypath/ → 前缀为 "/mypath"
+// 实现：去掉可能的尾随文件名（index.html 等），保证以 "/" 结尾；根路径返回 ""。
+// 不论反代是否在服务端 strip 前缀，前端都用此子路径作为前缀，与后端 normalizePath 对齐。
+const API_PREFIX = (function(){
+  let p = location.pathname || "/";
+  p = p.replace(/\/[^\/]*\.(html?|php|htm)$/i, "");
+  if (p === "" || p === "/") return "";
+  if (!p.endsWith("/")) p += "/";
+  return p;
+})();
+function api(path){ return API_PREFIX + path; }
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2200); }
 
 // v1.4.0：全局错误展示
@@ -179,17 +200,24 @@ function showGlobalErr(msg){
   console.error('[KanmenDog UI Error]', msg);
 }
 
-async function refresh(){
+// v1.9.0：拆出「仅刷新状态」函数 —— 自动轮询与手动「刷新状态」只更新运行指标，
+// 绝不重新渲染参数表单，避免把用户正在编辑但尚未保存的参数覆盖掉（即「保存不生效」的根因）。
+async function refreshStatus(){
   try {
-    const s = await (await fetch('/api/status')).json();
+    const s = await (await fetch(api('/api/status'))).json();
     renderStatus(s);
   } catch(e) {
     showGlobalErr('获取状态失败: ' + e.message + '（服务可能未正常启动）');
     return;
   }
+}
 
+// 完整刷新：状态 + 参数表单。仅页面初次加载时调用（refresh() 一次性），
+// 之后所有自动/手动刷新都走 refreshStatus()，从而保护用户未保存的编辑。
+async function refresh(){
+  await refreshStatus();
   try {
-    const c = await (await fetch('/api/config')).json();
+    const c = await (await fetch(api('/api/config'))).json();
     renderConfig(c);
   } catch(e) {
     showGlobalErr('获取配置失败: ' + e.message + '（配置文件可能损坏或未初始化）');
@@ -201,12 +229,26 @@ function renderStatus(s){
   const pill = on => `<span class="pill ${on?'on':'off'}">${on?'运行中':'已停止'}</span>`;
   const wd = s.watchdog_open ? '<span class="pill on">已开启</span>' : '<span class="pill off">未开启</span>';
   const wdId = s.watchdog_identity || 'unknown';
-  const wdKind = wdId==='none' ? '无设备' : (String(wdId).toLowerCase().includes('softdog') ? '软件看门狗' : '硬件看门狗');
+  // 看门狗类型与兜底能力：硬件看门狗能真兜底死机，软件看门狗(softdog)在内核冻结时无法复位
+  let wdKind = '未知', wdBackup = '', wdColor = 'var(--muted)';
+  if (wdId === 'none') {
+    wdKind = '无设备';
+    wdBackup = '❌ 无兜底能力（死机无法自动重启）';
+    wdColor = 'var(--bad)';
+  } else if (String(wdId).toLowerCase().includes('softdog')) {
+    wdKind = '软件看门狗 (softdog)';
+    wdBackup = '⚠️ 内核冻结时无法硬复位，无真正兜底';
+    wdColor = 'var(--warn)';
+  } else {
+    wdKind = '硬件看门狗 (' + wdId + ')';
+    wdBackup = '✅ 内核冻结可硬复位，真正兜底';
+    wdColor = 'var(--ok)';
+  }
   const memTxt = s.memory_used_pct<0 ? '?' : s.memory_used_pct+'%';
   const availTxt = s.mem_available_mb<0 ? '?' : s.mem_available_mb+' MB';
   $('stats').innerHTML = `
     <div class="stat"><div class="k">监控状态</div><div class="val">${pill(s.enabled)}</div></div>
-    <div class="stat"><div class="k">看门狗</div><div class="val">${wd}<div class="muted" style="font-size:11px">${wdKind} | ${wdId}</div></div></div>
+    <div class="stat"><div class="k">看门狗类型</div><div class="val">${wd}<div class="muted" style="font-size:11px">${wdKind}</div><div style="font-size:11px;color:${wdColor}">${wdBackup}</div></div></div>
     <div class="stat"><div class="k">看门狗超时</div><div class="val">${s.watchdog_timeout}s<div class="muted" style="font-size:11px">配置 ${s.watchdog_timeout_cfg}s${s.watchdog_timeout!==s.watchdog_timeout_cfg?' ⚠️被驱动调整':''}</div></div></div>
     ${s.nowayout ? '<div class="stat"><div class="k" style="color:var(--bad)">nowayout</div><div class="val" style="font-size:13px;color:var(--bad)">已锁定<div class="muted" style="font-size:11px">不可 magic close，停止服务也会硬复位</div></div></div>' : ''}
     <div class="stat"><div class="k">内存</div><div class="val">${memTxt}<div class="muted" style="font-size:11px">${availTxt} / ${s.total_memory_mb}MB 总量</div></div></div>
@@ -301,10 +343,12 @@ function renderConfig(c){
 const HTTPS_PORTS = new Set([5667, 8001, 443]);
 
 // 根据端口号生成 curl 探针命令
-function generateProbeCmd(port) {
+// scheme 可选：'http' 或 'https'，不传则根据 HTTPS_PORTS 预设表自动判断
+function generateProbeCmd(port, scheme) {
   if (!port) return '';
   const p = parseInt(port, 10);
-  if (HTTPS_PORTS.has(p)) {
+  const isHttps = (scheme === 'https') || (!scheme && HTTPS_PORTS.has(p));
+  if (isHttps) {
     return 'curl -sk -o /dev/null -m 5 https://127.0.0.1:' + p + '/';
   }
   return 'curl -s -o /dev/null -m 5 http://127.0.0.1:' + p + '/';
@@ -321,6 +365,25 @@ function extractPortFromCmd(cmd) {
 // 端口选择器变更 → 自动生成探针命令
 $('probe_port').addEventListener('change', function(){
   const port = this.value;
+  const customDiv = $('probe_custom_port');
+  const schemeDiv = $('probe_custom_scheme');
+
+  if (port === '__custom__') {
+    // 显示自定义端口输入框
+    customDiv.style.display = '';
+    schemeDiv.style.display = '';
+    customDiv.focus();
+    $('probeSchemeHint').textContent = '💡 输入端口号和协议后自动生成命令';
+    $('probeSchemeHint').style.color = 'var(--acc)';
+    // 如果已有值，立即生成
+    if (customDiv.value) generateCustomProbeCmd();
+    return;
+  }
+
+  // 隐藏自定义输入
+  customDiv.style.display = 'none';
+  schemeDiv.style.display = 'none';
+
   const cmd = generateProbeCmd(port);
   if (cmd) {
     $('service_probe_cmd').value = cmd;
@@ -338,25 +401,69 @@ $('probe_port').addEventListener('change', function(){
   }
 });
 
+// 自定义端口/协议变更 → 自动生成命令
+function generateCustomProbeCmd() {
+  const port = $('probe_custom_port').value;
+  const scheme = $('probe_custom_scheme').value;
+  if (!port || parseInt(port, 10) < 1 || parseInt(port, 10) > 65535) {
+    $('probeSchemeHint').textContent = '⚠️ 请输入有效端口号（1-65535）';
+    $('probeSchemeHint').style.color = 'var(--warn)';
+    return;
+  }
+  const cmd = generateProbeCmd(port, scheme);
+  if (cmd) {
+    $('service_probe_cmd').value = cmd;
+    if (scheme === 'https') {
+      $('probeSchemeHint').textContent = '✅ HTTPS 自定义端口 :' + port + '（-sk 跳过证书验证）';
+    } else {
+      $('probeSchemeHint').textContent = '✅ HTTP 自定义端口 :' + port;
+    }
+    $('probeSchemeHint').style.color = 'var(--ok)';
+  }
+}
+$('probe_custom_port').addEventListener('input', generateCustomProbeCmd);
+$('probe_custom_scheme').addEventListener('change', generateCustomProbeCmd);
+
 // 从现有命令同步端口选择器状态（页面加载时调用）
+// 注意：如果用户已手动选择了"自定义端口"模式，不要覆盖其输入状态
 function syncProbePortFromCmd(cmd) {
+  // 用户正在自定义端口编辑中 → 跳过同步，保留用户的输入状态
+  if ($('probe_port').value === '__custom__') return;
+
   const port = extractPortFromCmd(cmd);
-  if (port && $('probe_port').querySelector('value="' + port + '"')) {
+  // 检测协议
+  const isHttps = /https:/i.test(cmd);
+  if (port && $('probe_port').querySelector('[value="' + port + '"]')) {
+    // 预设端口 → 选中对应选项
     $('probe_port').value = port;
-    // 触发一次提示更新
-    if (HTTPS_PORTS.has(parseInt(port, 10))) {
+    $('probe_custom_port').style.display = 'none';
+    $('probe_custom_scheme').style.display = 'none';
+    if (isHttps || HTTPS_PORTS.has(parseInt(port, 10))) {
       $('probeSchemeHint').textContent = '✅ 当前使用 HTTPS';
       $('probeSchemeHint').style.color = 'var(--ok)';
-    } else if (port) {
+    } else {
       $('probeSchemeHint').textContent = '✅ 当前使用 HTTP';
       $('probeSchemeHint').style.color = 'var(--ok)';
     }
+  } else if (port) {
+    // 自定义端口（不在预设列表中）→ 选中"自定义"并回填端口号和协议
+    $('probe_port').value = '__custom__';
+    $('probe_custom_port').style.display = '';
+    $('probe_custom_scheme').style.display = '';
+    $('probe_custom_port').value = port;
+    $('probe_custom_scheme').value = isHttps ? 'https' : 'http';
+    $('probeSchemeHint').textContent = '✅ 自定义端口 :' + port + ' (' + (isHttps ? 'HTTPS' : 'HTTP') + ')';
+    $('probeSchemeHint').style.color = 'var(--ok)';
   } else if (cmd) {
-    // 命令存在但无法识别端口（可能是自定义命令）
+    // 命令存在但无法识别端口（可能是完全自定义的命令）
     $('probe_port').value = '';
+    $('probe_custom_port').style.display = 'none';
+    $('probe_custom_scheme').style.display = 'none';
     $('probeSchemeHint').textContent = '⚠️ 自定义命令，已跳过端口选择器';
     $('probeSchemeHint').style.color = 'var(--warn)';
   } else {
+    $('probe_custom_port').style.display = 'none';
+    $('probe_custom_scheme').style.display = 'none';
     $('probeSchemeHint').textContent = '';
   }
 }
@@ -376,8 +483,8 @@ function updateCountdown(unixSec){
 
 async function startMaint(){
   try {
-    const r = await fetch('/api/maintain?minutes=30',{method:'POST'});
-    if (r.ok) { toast('已进入维护模式（30分钟）'); refresh(); }
+    const r = await fetch(api('/api/maintain?minutes=30'),{method:'POST'});
+    if (r.ok) { toast('已进入维护模式（30分钟）'); refreshStatus(); }
     else toast('操作失败: ' + r.statusText);
   } catch(e) {
     toast('维护模式请求失败: ' + e.message);
@@ -385,8 +492,8 @@ async function startMaint(){
 }
 async function cancelMaint(){
   try {
-    const r = await fetch('/api/maintain?minutes=0',{method:'POST'});
-    if (r.ok) { toast('已取消维护模式'); refresh(); }
+    const r = await fetch(api('/api/maintain?minutes=0'),{method:'POST'});
+    if (r.ok) { toast('已取消维护模式'); refreshStatus(); }
     else toast('取消失败: ' + r.statusText);
   } catch(e) {
     toast('取消维护模式请求失败: ' + e.message);
@@ -400,10 +507,21 @@ async function saveConfig(){
       c[k] = Number($(k).value);
     for (const k of ['auto_reboot','check_fork','check_load','check_dstate','check_service_probe','check_memory'])
       c[k] = $(k).checked;
-    c.service_probe_cmd = $('service_probe_cmd').value;
+    // 自定义端口模式：直接从自定义输入框计算命令（不依赖 input 事件时序，确保保存时命令已生成）
+    if ($('probe_port').value === '__custom__') {
+      const cp = ($('probe_custom_port').value || '').trim();
+      const cs = $('probe_custom_scheme').value;
+      if (cp && parseInt(cp, 10) >= 1 && parseInt(cp, 10) <= 65535) {
+        c.service_probe_cmd = generateProbeCmd(cp, cs);
+      } else {
+        c.service_probe_cmd = $('service_probe_cmd').value; // 端口无效则保留原值（可能为空）
+      }
+    } else {
+      c.service_probe_cmd = $('service_probe_cmd').value;
+    }
     c.enabled = $('enabledSw').checked;
-    const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
-    if (r.ok) { toast('配置已保存'); refresh(); }
+    const r = await fetch(api('/api/config'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
+    if (r.ok) { toast('配置已保存'); refreshStatus(); }
     else toast('保存失败: ' + r.statusText);
   } catch(e) {
     toast('保存配置失败: ' + e.message);
@@ -411,7 +529,7 @@ async function saveConfig(){
 }
 async function loadLogs(){
   try {
-    const r = await fetch('/api/logs?lines=300');
+    const r = await fetch(api('/api/logs?lines=300'));
     const text = await r.text();
     $('logs').textContent = text || '(暂无日志)';
   } catch(e) {
@@ -420,16 +538,16 @@ async function loadLogs(){
 }
 $('enabledSw').addEventListener('change', async e=>{
   try {
-    const r = await fetch('/api/toggle?enabled='+(e.target.checked?1:0),{method:'POST'});
+    const r = await fetch(api('/api/toggle?enabled='+(e.target.checked?1:0)),{method:'POST'});
     toast(r.ok ? (e.target.checked?'监控已开启':'监控已暂停') : '操作失败: ' + r.statusText);
-    refresh();
+    refreshStatus();
   } catch(e) {
     toast('开关操作失败: ' + e.message);
   }
 });
 async function svc(a){
   try {
-    const r = await fetch('/api/service?action='+a,{method:'POST'});
+    const r = await fetch(api('/api/service?action='+a),{method:'POST'});
     const j = await r.json();
     const msg = (j.error ? '错误: '+j.error : a+' 完成') + (j.output ? ' ('+j.output+')':'') + (j.warn ? '\n⚠️ '+j.warn : '');
     toast(msg || (a+' 请求已发送'));
@@ -453,7 +571,7 @@ async function svc(a){
 // v1.4.0：健康检查诊断
 async function checkHealth(){
   try {
-    const h = await (await fetch('/api/health')).json();
+    const h = await (await fetch(api('/api/health'))).json();
     alert('KanmenDog 诊断信息:\n\n版本: ' + h.version +
       '\nPID: ' + h.pid +
       '\n运行时间: ' + h.uptime_sec + '秒' +
@@ -468,8 +586,18 @@ async function checkHealth(){
     alert('无法连接到 KanmenDog 服务: ' + e.message + '\n\n请确认：\n1. 服务正在运行\n2. 端口未被占用\n3. 防火墙未阻止访问');
   }
 }
+// 阻止所有输入框的 Enter 键触发表单提交（防止页面意外刷新）
+document.addEventListener('keydown', function(e){
+  if (e.key === 'Enter' && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) {
+    e.preventDefault();
+    // 探针命令输入框按 Enter 时自动保存（便利操作）
+    if (e.target.id === 'service_probe_cmd') saveConfig();
+  }
+});
+
 refresh(); loadLogs();
-setInterval(()=>{ refresh(); }, 15000);
+// 自动轮询只刷新状态（不重渲染参数表单），避免覆盖用户未保存的编辑
+setInterval(()=>{ refreshStatus(); }, 15000);
 </script>
 </body>
 </html>

@@ -1,6 +1,7 @@
 #!/bin/bash
 # cmd/install_callback —— 安装文件应用后执行：加载看门狗、写内核 lockup 兜底、注册 systemd 服务
-# v1.5.0：体验修复 —— 探针端口选择器+重启来源友好化+默认值一致性
+# v1.9.0：D 状态检查默认关闭（mdadm scrub/rsync/虚拟机直通易触发 D 状态误杀，改为默认关）
+# v1.5.0：体验修复 —— 探针端口选择器+重启来源友好化+默认值一致性+升级时自动修正旧版错误默认值
 # v1.4.0：安装后三大失效修复 —— 配置合并模式+UI错误处理+服务控制兼容+启动优化
 set -u
 
@@ -131,8 +132,10 @@ EOF
 
 # 6) 写入默认配置（与程序内置默认完全一致：保守阈值，零误杀优先）
 #    fail_threshold=18（10s 周期 × 18 = 3 分钟连续异常才判定）
-#    探针默认关闭；负载检查默认关闭（高负载≠死机）
+#    探针默认关闭；负载检查默认关闭（高负载≠死机）；D 状态检查默认关闭（mdadm scrub/rsync/虚拟机直通易误杀）
 #    v1.3.0：读取 wizard 探针选择（wizard_enable_probe），实现知情决策联动
+#    v1.5.0：新增默认值迁移 —— 旧版错误默认值（check_load=true 等）在升级时自动修正，
+#           不再依赖"仅首次安装写入"的逻辑，彻底解决"页面写推荐关但实际开着"的问题。
 PROBE_ENABLED="false"
 if [ "${wizard_enable_probe:-}" = "true" ] || [ "${wizard_enable_probe:-}" = "1" ]; then
   PROBE_ENABLED="true"
@@ -151,7 +154,7 @@ if [ ! -f "$PKGETC/config.json" ]; then
   "check_fork": true,
   "check_load": false,
   "load_threshold": 16,
-  "check_dstate": true,
+  "check_dstate": false,
   "dstate_threshold": 30,
   "check_memory": true,
   "mem_available_threshold": 2,
@@ -160,7 +163,40 @@ if [ ! -f "$PKGETC/config.json" ]; then
   "trend_interval": 5
 }
 EOF
-  log "已写入默认配置 $PKGETC/config.json（保守阈值：3 分钟连续异常才判定重启；探针=${PROBE_ENABLED}）"
+  log "已写入默认配置 $PKGETC/config.json（保守阈值：3 分钟连续异常才判定重启；D状态默认关、探针=${PROBE_ENABLED}）"
+else
+  # v1.5.0：升级场景 —— 修正旧版错误默认值（仅修正从未被用户手动改过的字段）
+  #    使用 python3 保证 JSON 合法性（fnOS 自带 python3）
+  python3 - "$PKGETC/config.json" <<'PYEOF' || log "警告：默认值迁移失败（配置文件可能被手动修改为非标准 JSON），请手动检查负载/探针开关"
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, 'r') as f:
+        cfg = json.load(f)
+except Exception as e:
+    print(f"无法解析配置: {e}")
+    sys.exit(1)
+
+changed = []
+# 旧版错误默认值修正表：（字段名，旧错误值，正确值）
+corrections = [
+    ("check_load", True, False),        # 旧版默认开，实际应该关（高负载≠死机）
+    ("check_service_probe", True, False), # 旧版可能默认开，应该关（需用户手动配端口）
+    ("check_dstate", True, False),      # v1.9.0 起默认关：mdadm scrub/rsync/虚拟机直通易误杀
+]
+for field, bad_val, good_val in corrections:
+    if cfg.get(field) == bad_val:
+        cfg[field] = good_val
+        changed.append(field)
+
+if changed:
+    with open(path, 'w') as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.write('\n')
+    print(f"已修正旧版错误默认值: {', '.join(changed)}（与页面提示一致）")
+else:
+    print("配置无需修正（所有默认值已正确或已被用户手动修改）")
+PYEOF
 fi
 
 # 7) 注册并启用服务（开机自启）
