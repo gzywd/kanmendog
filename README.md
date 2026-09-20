@@ -121,6 +121,7 @@ fnos install com.gzywd.kanmendog-v1.9.1.fpk
 | `fail_threshold` | 18 | 连续失败次数阈值（18×10s=3 分钟） |
 | `boot_grace_min` | 5 | 开机冷却期（分钟），期间不判定 |
 | `auto_reboot` | true | 判定死机后自动重启 |
+| `trend_interval` | 5 | 趋势日志采样间隔（健康检查**周期数**，`0`=关闭）。实际落盘间隔 = `trend_interval × interval_sec` 秒（默认 5×10=50 秒/条）。每个采样周期写一条系统快照到 `trend.csv`，记录内存使用率 / 可用内存(MB) / 1 分钟负载 / D 状态进程数 / 进程总数 / OOM 标记，用于复盘「内存缓慢爬升→OOM」等。取值 0–200，文件超 20MB 自动滚动为 `trend.csv.1` |
 
 ### 检查项
 
@@ -157,6 +158,7 @@ fnos install com.gzywd.kanmendog-v1.9.1.fpk
 - OOM 日志：`/var/lib/kanmendog/oom_logs/`（时间戳文件）
 - 重启原因：`/var/lib/kanmendog/reboot_reason.txt`（两段式：先写原因再补快照）
 - 内核参数备份：`/etc/kanmendog/sysctl_backup`（卸载时恢复原值）
+- 趋势日志：`/var/lib/kanmendog/trend.csv`（CSV 快照，超 20MB 滚动为 `trend.csv.1`），供复盘内存/OOM 爬升；采样频率由 `trend_interval` 控制
 
 ## 开发
 
