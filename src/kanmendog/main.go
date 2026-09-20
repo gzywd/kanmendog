@@ -210,6 +210,22 @@ func (c *Config) trendPath() string {
 func (c *Config) bootReasonPath() string {
 	return filepath.Join(c.varDir(), "boot_reason")
 }
+func (c *Config) lastBootIDPath() string {
+	return filepath.Join(c.varDir(), "last_boot_id")
+}
+
+// readLastBootID 读上次运行持久化的 boot_id 基线（用于判别"系统是否真的重启过"）。
+func (c *Config) readLastBootID() string {
+	if b, err := os.ReadFile(c.lastBootIDPath()); err == nil {
+		return strings.TrimSpace(string(b))
+	}
+	return ""
+}
+
+// writeLastBootID 持久化当前 boot_id，作为下次运行判断重启的基线。
+func (c *Config) writeLastBootID(id string) {
+	_ = os.WriteFile(c.lastBootIDPath(), []byte(id), 0o644)
+}
 
 // ---- 日志 ----
 
@@ -589,10 +605,36 @@ func (d *daemon) classifyBoot() {
 	upSec := uptimeMinutes() * 60
 	bootTime := now.Add(-time.Duration(upSec) * time.Second)
 
+	curBootID := readBootID()
+	prevBootID := d.cfg.readLastBootID()
+
+	// —— 重启判定前置：用 boot_id 基线区分"系统真的重启过"还是"只是看门狗/应用被重新拉起" ——
+	// 关键修复（v1.9.1）：classifyBoot 在每次进程启动时都会跑，而安装/重启应用时系统往往并未重启。
+	// 若不加 boot_id 基线，就会拿 wtmp 关机记录直接比对，把"app 重拉"误判成"异常重启"，
+	// 表现为"刚装上应用就提示异常重启（无干净关机记录）"。
+
+	// 1) 无历史基线（全新安装/首次运行）：没有证据就默认正常，绝不吓用户。
+	if prevBootID == "" {
+		d.writeBootReason(now, bootTime, bootNormal,
+			"首次运行：无历史基线，按正常处理（证据优先：无异常证据=正常）")
+		d.cfg.writeLastBootID(curBootID)
+		gLog.Write([]byte(fmt.Sprintf("[%s] 开机自检：首次运行，无历史基线，默认正常\n", now.Format(time.RFC3339))))
+		return
+	}
+
+	// 2) 系统未发生重启（boot_id 未变）：只是看门狗/应用重启，不重新判定重启来源，
+	//    保留上次真实开机的结论，杜绝"刚装上就提示异常重启"的误报。
+	if prevBootID == curBootID {
+		d.cfg.writeLastBootID(curBootID) // 基线不变，保证幂等
+		gLog.Write([]byte(fmt.Sprintf("[%s] 开机自检：boot_id 未变化（仅应用重启，系统未重启），保留上次重启来源结论\n", now.Format(time.RFC3339))))
+		return
+	}
+
+	// 3) 真正发生了系统重启（boot_id 改变）：执行原有证据分析。
 	// v1.5.0：证据优先原则 —— 默认正常，只有找到异常证据才降级
 	kind, detail := bootNormal, ""
 
-	// 1) 本程序判定？读 last_reboot_reason 首行时间戳
+	// 3.1) 本程序判定？读 last_reboot_reason 首行时间戳
 	if b, err := os.ReadFile(d.cfg.reasonPath()); err == nil {
 		firstLine := strings.TrimSpace(strings.SplitN(string(b), "\n", 2)[0])
 		if t, err := time.Parse(time.RFC3339, firstLine); err == nil {
@@ -603,7 +645,7 @@ func (d *daemon) classifyBoot() {
 		}
 	}
 
-	// 2) 正常关机？（有 wtmp shutdown 记录且时间吻合）
+	// 3.2) 正常关机？（有 wtmp shutdown 记录且时间吻合）
 	if kind == bootNormal {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		cmd := exec.CommandContext(ctx, "last", "-x", "-F", "shutdown")
@@ -624,26 +666,14 @@ func (d *daemon) classifyBoot() {
 		// last 命令失败/无 wtmp：保持 bootNormal（默认正常，不吓用户）
 	}
 
-	// 3) panic 细分（仅异常重启时查，journalctl 查询有成本）
+	// 3.3) panic 细分（仅异常重启时查，journalctl 查询有成本）
 	if kind == bootAbnormal && lastBootHadPanic() {
 		kind = bootPanic
 		detail = "上次启动的内核日志含 panic/oops 记录"
 	}
 
-	title := bootKindTitle[kind]
-	detailSuffix := ""
-	if detail != "" {
-		detailSuffix = " —— " + detail
-	}
-	gLog.Write([]byte(fmt.Sprintf("[%s] 开机自检：本次重启来源 = %s%s\n",
-		now.Format(time.RFC3339), title, detailSuffix)))
-
-	// 写 boot_reason（每次开机重写；状态页优先展示）
-	content := fmt.Sprintf("%s\n%s\n%s\n开机时刻: %s\n%s\n",
-		now.Format(time.RFC3339), title, detail,
-		bootTime.Format("2006-01-02 15:04:05"),
-		"提示: 异常重启时请在飞牛终端执行 journalctl -b -1 -k 与 last -x 复查根因")
-	_ = os.WriteFile(d.cfg.bootReasonPath(), []byte(content), 0o644)
+	d.writeBootReason(now, bootTime, kind, detail)
+	d.cfg.writeLastBootID(curBootID)
 
 	// 若本次重启与本程序判定无关，把旧 last_reboot_reason 归档，避免状态页误导
 	if kind != bootApp {
@@ -653,6 +683,23 @@ func (d *daemon) classifyBoot() {
 				now.Format(time.RFC3339))))
 		}
 	}
+}
+
+// writeBootReason 写开机自检结论到 boot_reason 文件（状态页优先展示）。
+// 文件格式：第 0 行时间戳、第 1 行来源标题、第 2 行证据明细、第 3 行开机时刻、第 4 行提示。
+func (d *daemon) writeBootReason(now, bootTime time.Time, kind bootKind, detail string) {
+	title := bootKindTitle[kind]
+	detailSuffix := ""
+	if detail != "" {
+		detailSuffix = " —— " + detail
+	}
+	gLog.Write([]byte(fmt.Sprintf("[%s] 开机自检：本次重启来源 = %s%s\n",
+		now.Format(time.RFC3339), title, detailSuffix)))
+	content := fmt.Sprintf("%s\n%s\n%s\n开机时刻: %s\n%s\n",
+		now.Format(time.RFC3339), title, detail,
+		bootTime.Format("2006-01-02 15:04:05"),
+		"提示: 异常重启时请在飞牛终端执行 journalctl -b -1 -k 与 last -x 复查根因")
+	_ = os.WriteFile(d.cfg.bootReasonPath(), []byte(content), 0o644)
 }
 
 // ---- 健康检查 ----
@@ -1778,7 +1825,8 @@ func (d *daemon) dstateCount() int {
 	return n
 }
 
-// readBootReasonSummary 读开机自检结论摘要（前两行：时间+来源标题）
+// readBootReasonSummary 读开机自检结论摘要（标题行 + 证据明细行）。
+// boot_reason 文件格式：第 0 行时间戳、第 1 行来源标题、第 2 行证据明细。
 func (d *daemon) readBootReasonSummary() string {
 	b, err := os.ReadFile(d.cfg.bootReasonPath())
 	if err != nil {
@@ -1786,7 +1834,15 @@ func (d *daemon) readBootReasonSummary() string {
 	}
 	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
 	if len(lines) >= 2 {
-		return lines[1] // 来源标题行
+		title := lines[1]
+		detail := ""
+		if len(lines) >= 3 {
+			detail = strings.TrimSpace(lines[2])
+		}
+		if detail != "" {
+			return title + "\n" + detail
+		}
+		return title
 	}
 	return ""
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # KanmenDog 构建脚本：编译 Go 二进制 + fnpack 打包 .fpk
-# v1.9.0：二进制加 -ldflags="-s -w" 剥离调试符号（体积更小），并同步 manifest 版本号
+# v1.9.1：二进制加 -ldflags="-s -w" 剥离调试符号（体积更小），并同步 manifest 版本号
 #
 # 用法：./scripts/build.sh
 # 前置依赖：

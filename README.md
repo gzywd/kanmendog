@@ -1,9 +1,21 @@
-# 看门狗 KanmenDog v1.9.0
+# 看门狗 KanmenDog v1.9.1
 
 > **零误杀 NAS 看门狗 —— 死机自动重启，正常使用/升级/重启绝不误判**
 
-[![Version](https://img.shields.io/badge/version-1.9.0-blue.svg)](https://github.com/gzywd/kanmendog/releases/tag/v1.9.0)
+[![Version](https://img.shields.io/badge/version-1.9.1-blue.svg)](https://github.com/gzywd/kanmendog/releases/tag/v1.9.1)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+## ✨ v1.9.1 更新（修复「刚装上就提示异常重启」误报）
+
+> 修复一个体验 bug：全新安装或重启应用后，状态页会误报「异常重启（无干净关机记录，疑似硬件复位/断电）」。
+
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| 刚装上/重启应用就提示异常重启 | `classifyBoot` 在**每次进程启动**都跑，且不区分「系统真重启过」与「只是 app 被重新拉起」；无历史基线时直接拿 wtmp 比对，把 app 重拉误判为异常重启 | 引入 `boot_id` 基线：仅当 `boot_id` 真正变化（系统重启）才做来源判定；系统未重启时保留上次真实结论，杜绝误报 |
+| 全新安装一打开就吓人 | 首装无历史基线，默认走了"异常重启"分支 | 首装（无基线）默认按「正常」处理（证据优先） |
+| 前端固定文案「疑似硬件复位/断电」 | UI 硬编码了与真实证据无关的结论 | 改为展示后端下发的**真实证据明细**，无证据时显示"系统运行正常" |
+
+> 真实异常重启（系统确实崩了/断电）仍会被正确识别——只有当 `boot_id` 改变且 wtmp/panic 给出异常证据时才标红，首装与单纯 app 重启不会再误报。
 
 ## ✨ v1.9.0 更新（质量审计修复）
 
@@ -82,8 +94,8 @@
 
 ### 方式一：飞牛应用中心手动安装（推荐）
 
-1. 下载对应版本的 `.fpk` 文件（以 [Release v1.9.0](https://github.com/gzywd/kanmendog/releases/tag/v1.9.0) 为例）：
-   `https://github.com/gzywd/kanmendog/releases/download/v1.9.0/com.gzywd.kanmendog-v1.9.0.fpk`
+1. 下载对应版本的 `.fpk` 文件（以 [Release v1.9.1](https://github.com/gzywd/kanmendog/releases/tag/v1.9.1) 为例）：
+   `https://github.com/gzywd/kanmendog/releases/download/v1.9.1/com.gzywd.kanmendog-v1.9.1.fpk`
 2. 飞牛应用中心 → 手动安装 → 选择 fpk
 3. 安装向导会询问是否启用 Web 探针（已自动探测端口）
 4. 打开应用页面确认状态
@@ -91,11 +103,11 @@
 ### 方式二：命令行安装
 
 ```bash
-# 下载 v1.9.0 release 包（文件名含版本号）
-wget https://github.com/gzywd/kanmendog/releases/download/v1.9.0/com.gzywd.kanmendog-v1.9.0.fpk
+# 下载 v1.9.1 release 包（文件名含版本号）
+wget https://github.com/gzywd/kanmendog/releases/download/v1.9.1/com.gzywd.kanmendog-v1.9.1.fpk
 
 # 通过 fnOS 命令安装（需要 fnOS 环境）
-fnos install com.gzywd.kanmendog-v1.9.0.fpk
+fnos install com.gzywd.kanmendog-v1.9.1.fpk
 ```
 
 ## 配置说明
@@ -162,6 +174,11 @@ bash scripts/build.sh
 ```
 
 ## 版本历史
+
+### v1.9.1 — 修复「刚装上就提示异常重启」误报
+- 引入 `boot_id` 基线：`classifyBoot` 仅在系统真正重启（`boot_id` 变化）时判定重启来源，app 被重新拉起不再误报
+- 全新安装（无历史基线）默认按「正常」处理（证据优先）
+- 前端不再硬编码「疑似硬件复位/断电」文案，改为展示后端真实证据明细
 
 ### v1.9.0 — 质量审计修复
 - 页面「参数保存不生效」根因修复：自动刷新不再覆盖正在编辑的参数表单

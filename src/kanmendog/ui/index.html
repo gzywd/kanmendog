@@ -273,16 +273,18 @@ function renderStatus(s){
   // 开机来源标注
   if (s.boot_reason) {
     $('bootSource').style.display = '';
-    const title = s.boot_reason;
-    let desc = '', color = 'var(--ok)'; // v1.5.0：默认绿色（正常）
-    if (title.includes('本程序判定')) { desc = '系统因连续异常被看门狗自动重启。'; color = 'var(--bad)'; }
-    else if (title.includes('异常重启') || title.includes('硬件')) { desc = '无干净关机记录，疑似硬件复位/断电/全核冻结。'; color = 'var(--bad)'; }
-    else if (title.includes('panic')) { desc = '内核 hard lockup 触发 panic→reboot。'; color = 'var(--bad)'; }
-    else if (title.includes('正常关机')) { desc = '用户主动关机或 reboot，系统运行正常。'; color = 'var(--ok)'; }
-    else { desc = '系统运行正常，未检测到异常重启。'; color = 'var(--ok)'; }
+    // boot_reason = "标题\n可选证据明细"，后端按真实证据下发，前端不再硬编码吓人文案
+    const parts = s.boot_reason.split('\n');
+    const title = parts[0];
+    const detail = parts.slice(1).join(' ').trim();
+    let color = 'var(--ok)'; // v1.5.0：默认绿色（正常）
+    if (title.includes('本程序判定') || title.includes('异常重启') ||
+        title.includes('硬件') || title.includes('panic')) {
+      color = 'var(--bad)';
+    }
     $('bootSourceVal').textContent = title;
     $('bootSourceVal').style.color = color;
-    $('bootSourceDetail').textContent = desc;
+    $('bootSourceDetail').textContent = detail || '系统运行正常，未检测到异常重启。';
   } else {
     $('bootSource').style.display = 'none';
   }
