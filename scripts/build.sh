@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # KanmenDog 构建脚本：编译 Go 二进制 + fnpack 打包 .fpk
-# v1.9.1：二进制加 -ldflags="-s -w" 剥离调试符号（体积更小），并同步 manifest 版本号
+# v1.9.2：ui/config 改走 fnOS Nginx 反代模式（移除 port 声明），修复网关/HTTPS 访问不了；二进制加 -ldflags="-s -w" 剥离调试符号，版本号从 manifest 自动读取
 #
 # 用法：./scripts/build.sh
 # 前置依赖：

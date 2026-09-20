@@ -1,9 +1,19 @@
-# 看门狗 KanmenDog v1.9.1
+# 看门狗 KanmenDog v1.9.2
 
 > **零误杀 NAS 看门狗 —— 死机自动重启，正常使用/升级/重启绝不误判**
 
-[![Version](https://img.shields.io/badge/version-1.9.1-blue.svg)](https://github.com/gzywd/kanmendog/releases/tag/v1.9.1)
+[![Version](https://img.shields.io/badge/version-1.9.2-blue.svg)](https://github.com/gzywd/kanmendog/releases/tag/v1.9.2)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+## ✨ v1.9.2 更新（修复「飞牛网关/HTTPS/反向代理访问不了」）
+
+> 修复一个反向代理/网关访问 bug：通过飞牛网关、FN Connect 远程访问或域名反代打开应用时，页面打不开。
+
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| 飞牛网关/HTTPS/反代访问不了 | `ui/config` 是「直连模式」（`protocol:http, port:8900`），fnOS 桌面 iframe 直连应用端口 `http://{hostname}:8900/`；在 HTTPS 页面下变成混合内容+端口不可达，且后端自 v1.9.0 起只绑 `127.0.0.1`，外部 IP:8900 连接被拒 | 改为 fnOS Nginx 反代模式（移除 `port` 声明），由 fnOS 反代转发到本机 `127.0.0.1:8900`；前端 `API_PREFIX` 与后端 `normalizePath` 已兼容 `/apps/{appname}/main/` 前缀，无需改动 |
+
+> **根因链**：v1.9.0 为安全把服务绑 `127.0.0.1`，v1.8.1 为修「回退 5666」又显式声明了 `port`——二者叠加，导致反代/网关场景**双重失败**。依据飞牛官方开发规范「HTTPS/域名场景不声明 port，由 fnOS Nginx 反代转发」修复。
 
 ## ✨ v1.9.1 更新（修复「刚装上就提示异常重启」误报）
 
@@ -94,8 +104,8 @@
 
 ### 方式一：飞牛应用中心手动安装（推荐）
 
-1. 下载对应版本的 `.fpk` 文件（以 [Release v1.9.1](https://github.com/gzywd/kanmendog/releases/tag/v1.9.1) 为例）：
-   `https://github.com/gzywd/kanmendog/releases/download/v1.9.1/com.gzywd.kanmendog-v1.9.1.fpk`
+1. 下载对应版本的 `.fpk` 文件（以 [Release v1.9.2](https://github.com/gzywd/kanmendog/releases/tag/v1.9.2) 为例）：
+   `https://github.com/gzywd/kanmendog/releases/download/v1.9.2/com.gzywd.kanmendog-v1.9.2.fpk`
 2. 飞牛应用中心 → 手动安装 → 选择 fpk
 3. 安装向导会询问是否启用 Web 探针（已自动探测端口）
 4. 打开应用页面确认状态
@@ -103,11 +113,11 @@
 ### 方式二：命令行安装
 
 ```bash
-# 下载 v1.9.1 release 包（文件名含版本号）
-wget https://github.com/gzywd/kanmendog/releases/download/v1.9.1/com.gzywd.kanmendog-v1.9.1.fpk
+# 下载 v1.9.2 release 包（文件名含版本号）
+wget https://github.com/gzywd/kanmendog/releases/download/v1.9.2/com.gzywd.kanmendog-v1.9.2.fpk
 
 # 通过 fnOS 命令安装（需要 fnOS 环境）
-fnos install com.gzywd.kanmendog-v1.9.1.fpk
+fnos install com.gzywd.kanmendog-v1.9.2.fpk
 ```
 
 ## 配置说明
@@ -177,20 +187,23 @@ bash scripts/build.sh
 
 ## 版本历史
 
+### v1.9.2 — 修复「飞牛网关/HTTPS/反向代理访问不了」
+- `ui/config` 由直连模式改为 fnOS Nginx 反代模式（移除 `port` 声明），由 fnOS 反代转发到本机 `127.0.0.1:8900`
+- 依据飞牛官方规范「HTTPS/域名场景不声明 port，由 fnOS Nginx 反代转发」；此前显式声明 port 导致 HTTPS 混合内容+端口不可达，且与后端 127.0.0.1 绑定冲突（外部 IP:8900 被拒）
+- 前端 `API_PREFIX`、后端 `normalizePath` 已兼容反代路径，本次无需改动
+
 ### v1.9.1 — 修复「刚装上就提示异常重启」误报
 - 引入 `boot_id` 基线：`classifyBoot` 仅在系统真正重启（`boot_id` 变化）时判定重启来源，app 被重新拉起不再误报
 - 全新安装（无历史基线）默认按「正常」处理（证据优先）
 - 前端不再硬编码「疑似硬件复位/断电」文案，改为展示后端真实证据明细
 
 ### v1.9.0 — 质量审计修复
-- 页面「参数保存不生效」根因修复：自动刷新不再覆盖正在编辑的参数表单
-- D 状态检查默认关闭（防 mdadm scrub/rsync/虚拟机直通误杀）
-- 死机判定改为「≥2 个独立检查族同时失败」才计一次，单检查超时按弃权处理
-- triggerReboot 硬件兜底重写（保持 fd + 停喂狗 + reboot 阶梯），不再盲目 close
-- 维护窗口最长 60 分钟自动退场，杜绝常驻进程锁死后永久静默
-- 全 goroutine 加 recover()；日志按分钟轮转；修复数据竞争（go test -race 确认）
-- 接口绑定 127.0.0.1 + 同源/CSRF 校验 + 探针命令白名单（堵无鉴权与命令注入）
-- 安装向导补回 Web 探针开关；版本号全局统一；二进制剥离调试符号
+- **体验**：页面「参数保存不生效」修复——自动刷新只更新运行指标，不再覆盖正在编辑的参数表单
+- **防误杀**：D 状态检查默认关闭（防 mdadm scrub/rsync/虚拟机直通误杀）；死机判定改为「≥2 个独立检查族同时失败」才计一次，单检查超时按弃权处理
+- **兜底可靠**：triggerReboot 硬件兜底重写（保持 fd 打开 + 停喂狗 + reboot 阶梯），不再盲目 close 导致 nowayout 下失活；维护窗口最长 60 分钟自动退场
+- **健壮性**：全 goroutine 加 recover() 防 panic 致死；日志按分钟轮转；修复数据竞争（go test -race 确认）
+- **安全**：接口绑定 127.0.0.1 + 同源/CSRF 校验 + 探针命令白名单，堵无鉴权与任意 root 命令注入
+- **接线**：安装向导补回 Web 探针开关；版本号全局统一；二进制剥离调试符号
 
 ### v1.3.0 — 产品闭环
 - 开机重启来源标注（wtmp/journalctl 分类）
