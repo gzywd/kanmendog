@@ -1,19 +1,23 @@
-# 看门狗 KanmenDog v1.9.2
+# 看门狗 KanmenDog v1.9.3
 
 > **零误杀 NAS 看门狗 —— 死机自动重启，正常使用/升级/重启绝不误判**
 
-[![Version](https://img.shields.io/badge/version-1.9.2-blue.svg)](https://github.com/gzywd/kanmendog/releases/tag/v1.9.2)
+[![Version](https://img.shields.io/badge/version-1.9.3-blue.svg)](https://github.com/gzywd/kanmendog/releases/tag/v1.9.3)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-## ✨ v1.9.2 更新（修复「飞牛网关/HTTPS/反向代理访问不了」）
+## ✨ v1.9.3 更新（正确接入飞牛统一网关：彻底修复「点图标开新飞牛页面 / 网关反代打不开」）
 
-> 修复一个反向代理/网关访问 bug：通过飞牛网关、FN Connect 远程访问或域名反代打开应用时，页面打不开。
+> 对照飞牛官方开发文档与参考仓库 `fnos_music_ext` 重写网关接入。前期 v1.9.2 的「移除 port」只做对了一半——缺少 `gatewayPrefix`/`gatewaySocket`，飞牛网关根本没建转发规则，点图标就退化成打开一个新飞牛页面。
 
 | 问题 | 根因 | 修复 |
 |---|---|---|
-| 飞牛网关/HTTPS/反代访问不了 | `ui/config` 是「直连模式」（`protocol:http, port:8900`），fnOS 桌面 iframe 直连应用端口 `http://{hostname}:8900/`；在 HTTPS 页面下变成混合内容+端口不可达，且后端自 v1.9.0 起只绑 `127.0.0.1`，外部 IP:8900 连接被拒 | 改为 fnOS Nginx 反代模式（移除 `port` 声明），由 fnOS 反代转发到本机 `127.0.0.1:8900`；前端 `API_PREFIX` 与后端 `normalizePath` 已兼容 `/apps/{appname}/main/` 前缀，无需改动 |
+| 点应用图标开新飞牛页面 / 网关反代打不开 | `ui/config` 缺 `gatewayPrefix` 与 `gatewaySocket`，飞牛网关未建立 `/app/{appname}` 转发；且后端 `gatewayPrefix` 错写成 `/apps/{appname}/main`（v1.8.0 臆测），应用只监听 TCP `127.0.0.1:8900` | ① `ui/config` 声明 `gatewayPrefix=/app/com.gzywd.kanmendog` + `gatewaySocket=ui.sock` + `protocol` 置空；② 应用改监听 **Unix 域套接字** `${TRIM_APPDEST}/ui.sock`，飞牛网关把 `/app/{appname}` 反代到此；③ 后端网关前缀修正为真实的 `/app/{appname}`。局域网 / FN Connect 远程(HTTPS) / 自建反代**统一走网关**，应用不暴露 TCP 端口 |
 
-> **根因链**：v1.9.0 为安全把服务绑 `127.0.0.1`，v1.8.1 为修「回退 5666」又显式声明了 `port`——二者叠加，导致反代/网关场景**双重失败**。依据飞牛官方开发规范「HTTPS/域名场景不声明 port，由 fnOS Nginx 反代转发」修复。
+> **根因链**：fnOS 桌面「打开应用」是 fnOS 网关 nginx 把 `/app/{appname}` 反代到应用暴露的 Unix 套接字。此前没声明 `gatewaySocket`，网关无转发目标 → 退化成开新页；后端前缀又写错 → 即便通了路径也不对。正确做法（官方规范 + fnos_music_ext 实证）：`protocol:""` + `gatewayPrefix` + `gatewaySocket`，应用监听 `ui.sock`。
+
+## ✨ v1.9.2 更新（网关修复初版，已被 v1.9.3 完善）
+
+> v1.9.2 把 `ui/config` 由直连模式改为移除 `port` 声明（fnOS Nginx 反代方向正确），但漏了 `gatewayPrefix`/`gatewaySocket`，未能真正打通网关。v1.9.3 补齐完成。
 
 ## ✨ v1.9.1 更新（修复「刚装上就提示异常重启」误报）
 
@@ -104,8 +108,8 @@
 
 ### 方式一：飞牛应用中心手动安装（推荐）
 
-1. 下载对应版本的 `.fpk` 文件（以 [Release v1.9.2](https://github.com/gzywd/kanmendog/releases/tag/v1.9.2) 为例）：
-   `https://github.com/gzywd/kanmendog/releases/download/v1.9.2/com.gzywd.kanmendog-v1.9.2.fpk`
+1. 下载对应版本的 `.fpk` 文件（以 [Release v1.9.3](https://github.com/gzywd/kanmendog/releases/tag/v1.9.3) 为例）：
+   `https://github.com/gzywd/kanmendog/releases/download/v1.9.3/com.gzywd.kanmendog-v1.9.3.fpk`
 2. 飞牛应用中心 → 手动安装 → 选择 fpk
 3. 安装向导会询问是否启用 Web 探针（已自动探测端口）
 4. 打开应用页面确认状态
@@ -113,11 +117,11 @@
 ### 方式二：命令行安装
 
 ```bash
-# 下载 v1.9.2 release 包（文件名含版本号）
-wget https://github.com/gzywd/kanmendog/releases/download/v1.9.2/com.gzywd.kanmendog-v1.9.2.fpk
+# 下载 v1.9.3 release 包（文件名含版本号）
+wget https://github.com/gzywd/kanmendog/releases/download/v1.9.3/com.gzywd.kanmendog-v1.9.3.fpk
 
 # 通过 fnOS 命令安装（需要 fnOS 环境）
-fnos install com.gzywd.kanmendog-v1.9.2.fpk
+fnos install com.gzywd.kanmendog-v1.9.3.fpk
 ```
 
 ## 配置说明
@@ -187,10 +191,14 @@ bash scripts/build.sh
 
 ## 版本历史
 
-### v1.9.2 — 修复「飞牛网关/HTTPS/反向代理访问不了」
-- `ui/config` 由直连模式改为 fnOS Nginx 反代模式（移除 `port` 声明），由 fnOS 反代转发到本机 `127.0.0.1:8900`
-- 依据飞牛官方规范「HTTPS/域名场景不声明 port，由 fnOS Nginx 反代转发」；此前显式声明 port 导致 HTTPS 混合内容+端口不可达，且与后端 127.0.0.1 绑定冲突（外部 IP:8900 被拒）
-- 前端 `API_PREFIX`、后端 `normalizePath` 已兼容反代路径，本次无需改动
+### v1.9.3 — 正确接入飞牛统一网关
+- `ui/config` 声明 `gatewayPrefix=/app/com.gzywd.kanmendog` + `gatewaySocket=ui.sock` + `protocol` 置空
+- 应用改监听 Unix 域套接字 `${TRIM_APPDEST}/ui.sock`，由飞牛网关把 `/app/{appname}` 反代到此；局域网/FN Connect 远程(HTTPS)/自建反代统一走网关
+- 后端网关前缀由错误的 `/apps/{appname}/main` 修正为真实的 `/app/{appname}`；TCP 8900 保留为直连备选
+- 对照飞牛官方开发文档与参考仓库 `fnos_music_ext`，彻底修复「点图标开新飞牛页面、网关反代打不开」
+
+### v1.9.2 — 网关修复初版（已被 v1.9.3 完善）
+- `ui/config` 移除 `port` 声明（fnOS Nginx 反代方向正确），但漏了 `gatewayPrefix`/`gatewaySocket`，未能真正打通网关
 
 ### v1.9.1 — 修复「刚装上就提示异常重启」误报
 - 引入 `boot_id` 基线：`classifyBoot` 仅在系统真正重启（`boot_id` 变化）时判定重启来源，app 被重新拉起不再误报

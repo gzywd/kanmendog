@@ -2412,14 +2412,15 @@ func (d *daemon) startHTTP() {
 	mux.HandleFunc("/api/purge-data", d.handlePurgeData) // v1.5.0: 标记卸载时清理数据
 	mux.HandleFunc("/api/clear-data", d.handleClearData) // v1.5.0: 立即清除应用数据
 
-	// 反代/网关兼容：兼容三种访问方式，后端统一归一化到根路径后再交给 mux：
-	//   1. 直接访问（无前缀）：/api/status、/
-	//   2. fnOS 桌面网关：/apps/{appname}/main/api/status、/apps/{appname}/main/
-	//   3. 任意域名反代子路径（nginx/隧道等「未 strip 前缀」配置）：
-	//      /mypath/api/status、/mypath/ —— 把首个 /api/ 之前整段当作反代前缀剥离
-	// 关键：无论反代是否 strip 前缀，前端都用 location.pathname 算出子路径作为 API 前缀，
-	//      后端同时兼容 strip（收到干净 /api/...）与未 strip（收到 /子路径/api/...）两种转发。
-	gatewayPrefix := fmt.Sprintf("/apps/%s/main", appName)
+	// fnOS 统一网关：应用经由 ${TRIM_APPDEST}/ui.sock（由 ui/config 的 gatewaySocket 指定）
+	// 暴露，飞牛网关把 /app/{appname} 反代到此。因此局域网、FN Connect 远程(HTTPS)、
+	// 用户自建反代统一走网关，应用本身不暴露 TCP 端口。后端归一化三种访问方式：
+	//   1. 直连（无前缀）：/api/status、/
+	//   2. fnOS 网关：/app/{appname}/api/status、/app/{appname}/
+	//   3. 用户自建反代子路径（nginx/隧道未 strip 前缀）：/mypath/api/status、/mypath/
+	// 关键：前端用 location.pathname 算出子路径作 API 前缀，后端按 gatewayPrefix 与 /api/ 兜底
+	//      两种转发都兼容。
+	gatewayPrefix := fmt.Sprintf("/app/%s", appName)
 	normalizePath := func(raw string) string {
 		if strings.HasPrefix(raw, gatewayPrefix) {
 			raw = strings.TrimPrefix(raw, gatewayPrefix)
@@ -2448,29 +2449,54 @@ func (d *daemon) startHTTP() {
 	d.mu.Lock()
 	port := d.cfg.Port
 	d.mu.Unlock()
-	// P0 安全（v1.9.0）：默认只绑 127.0.0.1。fnOS 网关与用户反代都在本机转发到 127.0.0.1:port，
-	// 因此远程访问不受影响；但局域网内裸 IP:8900 不再可被任意设备访问，杜绝未授权读写。
-	// 仅当用户确需"直连非本机访问"时，设置环境变量 KANMENDOG_BIND_ADDR=0.0.0.0 放开。
+	// P0 安全（v1.9.0）：TCP 默认只绑 127.0.0.1；局域网直连用 KANMENDOG_BIND_ADDR=0.0.0.0 放开。
 	bindHost := envOr("KANMENDOG_BIND_ADDR", "127.0.0.1")
 	if bindHost == "" {
 		bindHost = "127.0.0.1"
 	}
 	addr := net.JoinHostPort(bindHost, strconv.Itoa(port))
-	logf("Web 服务启动于 %s（网关前缀 %s，已兼容域名反代子路径；绑定仅本机 127.0.0.1，如需局域网直连设 KANMENDOG_BIND_ADDR=0.0.0.0）", addr, gatewayPrefix)
 
-	// 端口监听失败重试；仍失败则解除看门狗并阻塞，避免在 nowayout 机器上陷入"硬复位循环"。
-	var ln net.Listener
-	var err error
-	for i := 0; i < 5; i++ {
-		ln, err = net.Listen("tcp", addr)
-		if err == nil {
-			break
+	// fnOS 统一网关（核心）：监听 Unix 域套接字 ${TRIM_APPDEST}/ui.sock。
+	// 网关按 ui/config 的 gatewaySocket 文件名找到它，把 /app/{appname} 反代到此，
+	// 局域网 / FN Connect 远程(HTTPS) / 用户自建反代全部统一走网关，应用不暴露 TCP 端口。
+	appdest := envOr("TRIM_APPDEST", "/var/apps/"+appName+"/target")
+	sockPath := filepath.Join(appdest, "ui.sock")
+
+	srv := &http.Server{Handler: root, ReadHeaderTimeout: 10 * time.Second}
+
+	var listeners []net.Listener
+
+	// 1) 网关 Unix socket（优先：fnOS 桌面 / 远程 / 反代统一入口）
+	if mkErr := os.MkdirAll(filepath.Dir(sockPath), 0o755); mkErr == nil {
+		// 先清理可能残留的孤儿 socket 文件，避免绑定到已删除 inode 留下永久孤儿进程
+		_ = os.Remove(sockPath)
+		if lnU, e := net.Listen("unix", sockPath); e == nil {
+			_ = os.Chmod(sockPath, 0o666) // 网关进程(nginx)需能 connect
+			listeners = append(listeners, lnU)
+			logf("网关 Unix socket 已监听 %s（fnOS 网关将 /app/%s 反代到此）", sockPath, appName)
+		} else {
+			logf("网关 socket %s 监听失败（网关访问不可用，但不影响本地 TCP 访问）: %v", sockPath, e)
 		}
+	} else {
+		logf("网关 socket 目录 %s 创建失败: %v", filepath.Dir(sockPath), mkErr)
+	}
+
+	// 2) TCP（直连 / 局域网 / 用户自建反代备选）；失败重试
+	ln, err := net.Listen("tcp", addr)
+	for i := 0; i < 5 && err != nil; i++ {
 		logf("HTTP 端口 %s 监听失败（第 %d 次重试）: %v", addr, i+1, err)
 		time.Sleep(time.Second)
+		ln, err = net.Listen("tcp", addr)
 	}
-	if err != nil {
-		logf("!!! HTTP 端口 %s 持续无法监听：已解除看门狗并阻塞进程，避免 nowayout 机器陷入硬复位循环（请通过 fnOS 应用中心重启服务或检查端口占用）", addr)
+	if err == nil {
+		listeners = append(listeners, ln)
+		logf("Web 服务启动于 %s（绑定 %s；如需局域网直连设 KANMENDOG_BIND_ADDR=0.0.0.0；网关前缀 %s）", addr, bindHost, gatewayPrefix)
+	} else {
+		logf("HTTP 端口 %s 持续无法监听: %v", addr, err)
+	}
+
+	if len(listeners) == 0 {
+		logf("!!! 网关 socket 与 TCP 端口均无法监听：已解除看门狗并阻塞进程，避免 nowayout 机器陷入硬复位循环（请通过 fnOS 应用中心重启服务或检查端口占用）")
 		d.mu.Lock()
 		if d.wd != nil {
 			d.wd.disarm()
@@ -2480,10 +2506,14 @@ func (d *daemon) startHTTP() {
 		d.mu.Unlock()
 		select {}
 	}
-	srv := &http.Server{Handler: root, ReadHeaderTimeout: 10 * time.Second}
-	if err := srv.Serve(ln); err != nil {
-		logf("HTTP 服务错误: %v", err)
+	for _, l := range listeners {
+		go func(l net.Listener) {
+			if e := srv.Serve(l); e != nil {
+				logf("HTTP 服务错误: %v", e)
+			}
+		}(l)
 	}
+	select {} // 永久运行（看门狗在进程内另起 goroutine）
 }
 
 func systemctlControl(action string) int {

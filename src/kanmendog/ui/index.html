@@ -179,7 +179,7 @@ const $ = id => document.getElementById(id);
 
 // 反代/网关兼容：根据当前页面真实路径算出 API 前缀，兼容三种访问方式：
 //   1. 直接访问（无子路径）：location.pathname = "/" → 前缀为 ""
-//   2. fnOS 桌面网关：/apps/{appname}/{entry}/ → 前缀为该网关路径
+//   2. fnOS 统一网关：/app/{appname}/ → 前缀为该网关路径
 //   3. 任意域名反代子路径（nginx/隧道等）：/mypath/ → 前缀为 "/mypath"
 // 实现：去掉可能的尾随文件名（index.html 等），保证以 "/" 结尾；根路径返回 ""。
 // 不论反代是否在服务端 strip 前缀，前端都用此子路径作为前缀，与后端 normalizePath 对齐。

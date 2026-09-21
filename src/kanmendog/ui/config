@@ -4,8 +4,10 @@
       "title": "看门狗 KanmenDog",
       "icon": "images/icon_64.png",
       "type": "iframe",
-      "protocol": "http",
-      "url": "/",
+      "protocol": "",
+      "gatewayPrefix": "/app/com.gzywd.kanmendog",
+      "gatewaySocket": "ui.sock",
+      "url": "/app/com.gzywd.kanmendog",
       "allUsers": false
     }
   }
